@@ -1,0 +1,207 @@
+<?php
+
+namespace App\Jobs\StatusPipeline;
+
+use App\Jobs\MediaPipeline\MediaDeletePipeline;
+use App\Models\AccountInterstitial;
+use App\Models\Bookmark;
+use App\Models\CollectionItem;
+use App\Models\DirectMessage;
+use App\Models\Like;
+use App\Models\Media;
+use App\Models\MediaTag;
+use App\Models\Mention;
+use App\Models\Notification;
+use App\Models\Report;
+use App\Models\Status;
+use App\Models\StatusArchived;
+use App\Models\StatusEdit;
+use App\Models\StatusHashtag;
+use App\Models\StatusView;
+use App\Services\Account\AccountStatService;
+use App\Services\AccountService;
+use App\Services\CollectionService;
+use App\Services\DirectMessageService;
+use App\Services\NotificationService;
+use App\Services\Status\ReplyCleanupService;
+use App\Services\StatusService;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
+
+class RemoteStatusDelete implements ShouldBeUniqueUntilProcessing, ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $status;
+
+    /**
+     * Delete the job if its models no longer exist.
+     *
+     * @var bool
+     */
+    public $deleteWhenMissingModels = true;
+
+    public $tries = 3;
+
+    public $maxExceptions = 3;
+
+    public $timeout = 180;
+
+    public $failOnTimeout = true;
+
+    /**
+     * The number of seconds after which the job's unique lock will be released.
+     *
+     * @var int
+     */
+    public $uniqueFor = 3600;
+
+    /**
+     * Get the unique ID for the job.
+     */
+    public function uniqueId(): string
+    {
+        return 'status:remote:delete:'.$this->status->id;
+    }
+
+    /**
+     * Get the middleware the job should pass through.
+     *
+     * @return array<int, object>
+     */
+    public function middleware(): array
+    {
+        return [(new WithoutOverlapping("status-remote-delete-{$this->status->id}"))->shared()->dontRelease()];
+    }
+
+    /**
+     * Create a new job instance.
+     *
+     * @return void
+     */
+    public function __construct(Status $status)
+    {
+        $this->status = $status->withoutRelations();
+    }
+
+    /**
+     * Execute the job.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $status = $this->status;
+
+        // Verify status exists
+        if (! $status) {
+            Log::info('RemoteStatusDelete: Status no longer exists, skipping job');
+
+            return;
+        }
+
+        if ($status->deleted_at) {
+            return;
+        }
+
+        StatusService::del($status->id, true);
+
+        // AccountStatService::decrementPostCount($status->profile_id);
+        $this->unlinkRemoveMedia($status);
+    }
+
+    public function unlinkRemoveMedia($status)
+    {
+
+        if ($status->in_reply_to_id) {
+            $parent = Status::find($status->in_reply_to_id);
+            if ($parent) {
+                Status::whereId($parent->id)->where('reply_count', '>', 0)->decrement('reply_count');
+                StatusService::del($parent->id);
+            }
+        }
+
+        AccountInterstitial::whereIn('item_type', ['App\Status', Status::class])
+            ->where('item_id', $status->id)
+            ->delete();
+        Bookmark::whereStatusId($status->id)->delete();
+        CollectionItem::whereIn('object_type', ['App\Status', Status::class])
+            ->whereObjectId($status->id)
+            ->get()
+            ->each(function ($col) {
+                CollectionService::removeItem($col->collection_id, $col->object_id);
+                $col->delete();
+            });
+        $dmIds = DirectMessage::whereStatusId($status->id)->pluck('id');
+        if ($dmIds->isNotEmpty()) {
+            Notification::whereIn('item_type', ['App\DirectMessage', DirectMessage::class])
+                ->whereIn('item_id', $dmIds)
+                ->cursor()
+                ->each(function ($not) {
+                    NotificationService::del($not->profile_id, $not->id);
+                    $not->forceDeleteQuietly();
+                });
+            DirectMessage::whereIn('id', $dmIds)->delete();
+        }
+        app(DirectMessageService::class)->deleteByStatusId($status->id);
+        Like::whereStatusId($status->id)->forceDelete();
+        $media = Media::whereStatusId($status->id)->get();
+        // Detach media from the status before dispatching deletion. status_id
+        // has no FK/cascade, so it is not cleared when the status is deleted;
+        // detaching here ensures the row is genuinely orphaned by the time the
+        // MediaDeletePipeline guard checks it, so the delete is not skipped.
+        Media::whereStatusId($status->id)->update(['status_id' => null]);
+        $media->each(function ($m) {
+            $m->status_id = null;
+            MediaDeletePipeline::dispatch($m)->onQueue('mmo');
+        });
+        $mediaTagIds = MediaTag::where('status_id', $status->id)->pluck('id');
+        if ($mediaTagIds->isNotEmpty()) {
+            Notification::whereIn('item_type', ['App\MediaTag', MediaTag::class])
+                ->whereIn('item_id', $mediaTagIds)
+                ->cursor()
+                ->each(function ($not) {
+                    NotificationService::del($not->profile_id, $not->id);
+                    $not->forceDeleteQuietly();
+                });
+            MediaTag::whereIn('id', $mediaTagIds)->delete();
+        }
+        Mention::whereStatusId($status->id)->forceDelete();
+        // Per-row (not bulk) so NotificationObserver::forceDeleted fires and
+        // NotificationService::del invalidates the 24h cached ITEM_KEY snapshot;
+        // a bulk forceDelete() would leave the web feed serving the deleted
+        // status as a ghost. Match the legacy 'App\Status' morph alias too.
+        Notification::whereIn('item_type', ['App\Status', Status::class])
+            ->where('item_id', $status->id)
+            ->cursor()
+            ->each(function ($not) {
+                NotificationService::del($not->profile_id, $not->id);
+                $not->forceDeleteQuietly();
+            });
+        Report::whereIn('object_type', ['App\Status', Status::class])
+            ->whereObjectId($status->id)
+            ->delete();
+        StatusArchived::whereStatusId($status->id)->delete();
+        // Purge edit history so remote deletion doesn't leave prior caption/CW
+        // versions behind (status_edits has no FK/cascade), mirroring StatusDelete.
+        StatusEdit::whereStatusId($status->id)->delete();
+        // Model-based delete so StatusHashtagObserver::deleted() runs and
+        // decrements hashtags.cached_count (a query-builder delete bypasses it).
+        StatusHashtag::whereStatusId($status->id)->get()->each->delete();
+        StatusView::whereStatusId($status->id)->delete();
+        ReplyCleanupService::releaseRepliesOf($status);
+
+        StatusService::del($status->id, true);
+        AccountService::del($status->profile_id);
+
+        $status->forceDelete();
+
+        return 1;
+    }
+}

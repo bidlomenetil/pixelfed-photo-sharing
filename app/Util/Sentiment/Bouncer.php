@@ -1,0 +1,136 @@
+<?php
+
+namespace App\Util\Sentiment;
+
+use App\Jobs\ReportPipeline\AutospamNotifyAdminViaEmail;
+use App\Models\AccountInterstitial;
+use App\Models\Status;
+use App\Services\AutospamService;
+use App\Services\NotificationService;
+use App\Services\StatusService;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
+
+class Bouncer
+{
+    public static function get(Status $status)
+    {
+        if ($status->uri || $status->scope != 'public') {
+            return;
+        }
+
+        if ($status->profile->user->is_admin == true) {
+            return;
+        }
+
+        $exemptionKey = 'pf:bouncer_v0:exemption_by_pid:'.$status->profile_id;
+        $exemptionTtl = now()->addDays(12);
+
+        if ($status->in_reply_to_id != null &&
+            $status->in_reply_to_profile_id == $status->profile_id
+        ) {
+            return;
+        }
+
+        $exemption = Cache::remember($exemptionKey, $exemptionTtl, function () use ($status) {
+            $uid = $status->profile->user_id;
+            $ids = AccountInterstitial::whereUserId($uid)
+                ->whereType('post.autospam')
+                ->whereIn('item_type', ['App\Status', Status::class])
+                ->whereNotNull('appeal_handled_at')
+                ->latest()
+                ->take(5)
+                ->pluck('item_id');
+
+            if ($ids->count() == 0) {
+                return false;
+            }
+
+            $count = Status::whereScope('public')
+                ->whereIn('id', $ids)
+                ->count();
+
+            return $count >= 1;
+        });
+
+        if ($exemption == true) {
+            return;
+        }
+
+        if ($status->profile->created_at->gt(now()->subMonths(6)) &&
+            $status->profile->bio &&
+            $status->profile->website
+        ) {
+            return (new self)->handle($status);
+        }
+
+        $recentKey = 'pf:bouncer_v0:recent_by_pid:'.$status->profile_id;
+        $recentTtl = now()->addHours(28);
+
+        $recent = Cache::remember($recentKey, $recentTtl, function () use ($status) {
+            return $status
+                ->profile
+                ->created_at
+                ->gt(now()->subMonths(6)) ||
+            $status
+                ->profile
+                ->statuses()
+                ->whereScope('public')
+                ->count() == 0;
+        });
+
+        if (! $recent) {
+            return;
+        }
+
+        if ($status->profile->followers()->count() > 100) {
+            return;
+        }
+
+        if (AutospamService::active()) {
+            if (AutospamService::check($status->caption)) {
+                return (new self)->handle($status);
+            }
+        }
+
+        if (! Str::contains($status->caption, [
+            'https://',
+            'http://',
+            'hxxps://',
+            'hxxp://',
+            'www.',
+            '.com',
+            '.net',
+            '.org',
+        ])) {
+            return;
+        }
+
+        return (new self)->handle($status);
+    }
+
+    protected function handle($status)
+    {
+        $ai = AccountInterstitial::createFromStatus($status, 'post.autospam', 'account.moderation.post.autospam');
+
+        if (config('instance.reports.email.enabled') && config('instance.reports.email.autospam')) {
+            AutospamNotifyAdminViaEmail::dispatch($ai);
+        }
+
+        $u = $status->profile->user;
+        $u->has_interstitial = true;
+        $u->save();
+
+        $status->scope = 'unlisted';
+        $status->visibility = 'unlisted';
+        // $status->is_nsfw = true;
+        $status->save();
+
+        NotificationService::createNotification($status->profile_id, $status->profile_id, 'autospam.warning', $status->id, Status::class);
+
+        StatusService::del($status->id);
+
+        Cache::forget('pf:bouncer_v0:exemption_by_pid:'.$status->profile_id);
+        Cache::forget('pf:bouncer_v0:recent_by_pid:'.$status->profile_id);
+    }
+}

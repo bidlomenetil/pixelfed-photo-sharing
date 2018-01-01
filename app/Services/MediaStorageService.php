@@ -1,0 +1,383 @@
+<?php
+
+namespace App\Services;
+
+use App\Jobs\AvatarPipeline\AvatarStorageCleanup;
+use App\Jobs\MediaPipeline\MediaDeletePipeline;
+use App\Jobs\StatusPipeline\NewStatusPipeline;
+use App\Models\Media;
+use App\Models\Status;
+use App\Util\ActivityPub\Helpers;
+use Illuminate\Http\File;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+
+class MediaStorageService
+{
+    public static function store(Media $media)
+    {
+        if ((bool) config_cache('pixelfed.cloud_storage') === true && config('filesystems.default') === 'local') {
+            (new self)->cloudStore($media);
+        }
+    }
+
+    public static function move(Media $media)
+    {
+        if ($media->remote_media) {
+            return;
+        }
+
+        if ((bool) config_cache('pixelfed.cloud_storage') === true && config('filesystems.default') === 'local') {
+            return (new self)->cloudMove($media);
+        }
+    }
+
+    public static function avatar($avatar, $local = false, $skipRecentCheck = false)
+    {
+        return (new self)->fetchAvatar($avatar, $local, $skipRecentCheck);
+    }
+
+    public static function head($url)
+    {
+        // SSRF-hardened: validates URL, resolves + rejects private/reserved
+        // IPs, pins the connection to the validated address, and refuses to
+        // follow redirects into internal networks. See SecureMediaFetchService.
+        return SecureMediaFetchService::head($url, (int) config_cache('pixelfed.max_photo_size') * 1000);
+    }
+
+    protected function cloudStore($media)
+    {
+        if ($media->remote_media == true) {
+            if (config('media.storage.remote.cloud')) {
+                (new self)->remoteToCloud($media);
+            }
+        } else {
+            (new self)->localToCloud($media);
+        }
+
+        /*
+         * Read status_id fresh from the database.
+         *
+         * $media was unserialized when MediaStoragePipeline started. A status
+         * can be attached to it (POST /api/v1/statuses) while the upload above
+         * is in flight, in which case $media->status_id is a stale null and
+         * the NewStatusPipeline dispatched by the controller has already
+         * returned early because cdn_url was not set yet. Trusting the stale
+         * value here means that post is never lexed or federated.
+         */
+        $statusId = Media::whereKey($media->id)->value('status_id');
+
+        if (! $statusId) {
+            return;
+        }
+
+        if ($statusId != $media->status_id) {
+            // Attached mid-upload: localToCloud() skipped these with the stale null.
+            Cache::forget('pf:status:ap:v1:sid:'.$statusId);
+            Cache::forget('status:transformer:media:attachments:'.$statusId);
+            MediaService::del($statusId);
+            StatusService::del($statusId, false);
+        }
+
+        if (config_cache('pixelfed.cloud_storage') && ! config('pixelfed.media_fast_process')) {
+            $still_processing = Media::whereStatusId($statusId)
+                ->whereNull('cdn_url')
+                ->exists();
+            if (! $still_processing) {
+                // In this configuration, publishing the status is delayed until the media uploads
+                // Since all media have been processed, we can kick the NewStatusPipeline job
+                // N.B. there's a timing condition with multiple MediaStorageService workers matching this if statement
+                // NewStatusPipeline holds a short lock so the status is only lexed and federated once
+                $status = Status::where('id', $statusId)->first(); // This could be null if the status was deleted
+                if ($status) {
+                    NewStatusPipeline::dispatch($status);
+                }
+            }
+        }
+    }
+
+    protected function localToCloud($media)
+    {
+        $path = storage_path('app/'.$media->media_path);
+        $thumb = null;
+        $thumbname = null;
+
+        if ($media->thumbnail_path) {
+            $thumb = storage_path('app/'.$media->thumbnail_path);
+        }
+
+        $p = explode('/', $media->media_path);
+        $name = array_pop($p);
+        $pt = explode('/', $media->thumbnail_path);
+        $thumbname = array_pop($pt);
+        $storagePath = implode('/', $p);
+
+        $url = ResilientMediaStorageService::store($storagePath, $path, $name);
+        if ($media->thumbnail_path) {
+            $thumbUrl = ResilientMediaStorageService::store($storagePath, $thumb, $thumbname);
+            $media->thumbnail_url = $thumbUrl;
+        }
+        $media->cdn_url = $url;
+        $media->optimized_url = $url;
+        $media->replicated_at = now();
+        $media->save();
+        if ((bool) config_cache('pixelfed.cloud_storage') && (bool) config('media.delete_local_after_cloud')) {
+            $s3Domain = config('filesystems.disks.s3.url') ?? config('filesystems.disks.s3.endpoint');
+            if (str_contains($url, $s3Domain)) {
+                if (file_exists($path)) {
+                    unlink($path);
+                }
+
+                if (file_exists($thumb)) {
+                    unlink($thumb);
+                }
+            }
+        }
+        if ($media->status_id) {
+            Cache::forget('pf:status:ap:v1:sid:'.$media->status_id);
+            Cache::forget('status:transformer:media:attachments:'.$media->status_id);
+            MediaService::del($media->status_id);
+            StatusService::del($media->status_id, false);
+        }
+    }
+
+    protected function remoteToCloud($media)
+    {
+        $url = $media->remote_url;
+
+        if (! Helpers::validateUrl($url)) {
+            return;
+        }
+
+        // Hardened HEAD (IP-validated, pinned, no internal redirects).
+        $head = static::head($url);
+
+        if (! $head) {
+            return;
+        }
+
+        $mimes = [
+            'image/jpg',
+            'image/jpeg',
+            'image/png',
+            'video/mp4',
+        ];
+
+        $mime = $head['mime'];
+        $max_size = (int) config_cache('pixelfed.max_photo_size') * 1000;
+        $media->size = $head['length'];
+        $media->remote_media = true;
+        $media->save();
+
+        if (! in_array($mime, $mimes)) {
+            return;
+        }
+
+        if ($head['length'] >= $max_size) {
+            return;
+        }
+
+        $ext = '';
+
+        switch ($mime) {
+            case 'image/png':
+                $ext = '.png';
+                break;
+
+            case 'image/gif':
+                $ext = '.gif';
+                break;
+
+            case 'image/jpg':
+            case 'image/jpeg':
+                $ext = '.jpg';
+                break;
+
+            case 'video/mp4':
+                $ext = '.mp4';
+                break;
+        }
+
+        $base = MediaPathService::get($media->profile);
+        $path = Str::random(40).$ext;
+        $tmpBase = storage_path('app/remcache/');
+        $tmpPath = $media->profile_id.'-'.$path;
+        $tmpName = $tmpBase.$tmpPath;
+        // Hardened byte fetch through the same validated, pinned, redirect-safe path.
+        $data = SecureMediaFetchService::get($url, $max_size, $head['length']);
+        if ($data === false) {
+            return;
+        }
+        file_put_contents($tmpName, $data);
+
+        try {
+            $hash = hash_file('sha256', $tmpName);
+
+            $disk = Storage::disk(config('filesystems.cloud'));
+            $file = $disk->putFileAs($base, new File($tmpName), $path, 'public');
+            $permalink = $disk->url($file);
+
+            $media->media_path = $file;
+            $media->cdn_url = $permalink;
+            $media->original_sha256 = $hash;
+            $media->replicated_at = now();
+            $media->save();
+
+            if ($media->status_id) {
+                Cache::forget('status:transformer:media:attachments:'.$media->status_id);
+            }
+        } finally {
+            if (is_file($tmpName)) {
+                @unlink($tmpName);
+            }
+        }
+    }
+
+    protected function fetchAvatar($avatar, $local = false, $skipRecentCheck = false)
+    {
+        $queue = random_int(1, 15) > 5 ? 'mmo' : 'low';
+        $url = $avatar->remote_url;
+        $driver = $local ? 'local' : config('filesystems.cloud');
+
+        if (empty($url) || Helpers::validateUrl($url) == false) {
+            return;
+        }
+
+        $head = static::head($url);
+
+        if ($head == false) {
+            return;
+        }
+
+        $mimes = [
+            'application/octet-stream',
+            'image/jpg',
+            'image/jpeg',
+            'image/png',
+            'image/webp',
+        ];
+
+        $mime = $head['mime'];
+        $max_size = (int) config('pixelfed.max_avatar_size') * 1000;
+
+        if (! $skipRecentCheck) {
+            if ($avatar->last_fetched_at && $avatar->last_fetched_at->gt(now()->subMonths(3))) {
+                return;
+            }
+        }
+
+        Cache::forget('avatar:'.$avatar->profile_id);
+        AccountService::del($avatar->profile_id);
+
+        // handle pleroma edge case
+        if (Str::endsWith($mime, '; charset=utf-8')) {
+            $mime = str_replace('; charset=utf-8', '', $mime);
+        }
+
+        if (! in_array($mime, $mimes)) {
+            return;
+        }
+
+        if ($head['length'] >= $max_size) {
+            return;
+        }
+
+        $base = ($local ? 'public/cache/' : 'cache/').'avatars/'.$avatar->profile_id;
+        $tmpBase = storage_path('app/remcache/');
+        $data = SecureMediaFetchService::get($url, $max_size, $head['length']);
+        if (! $data) {
+            return;
+        }
+
+        $tmpPath = 'avatar_'.$avatar->profile_id.'-tmp';
+        $tmpName = $tmpBase.$tmpPath;
+        file_put_contents($tmpName, $data);
+
+        try {
+            $mimeCheck = Storage::mimeType('remcache/'.$tmpPath);
+
+            if (! $mimeCheck || ! in_array($mimeCheck, ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'])) {
+                $avatar->last_fetched_at = now();
+                $avatar->save();
+
+                return;
+            }
+
+            $ext = match ($mimeCheck) {
+                'image/png' => 'png',
+                'image/webp' => 'webp',
+                default => 'jpg',
+            };
+            $path = 'avatar_'.strtolower(Str::random(random_int(3, 6))).'.'.$ext;
+
+            $disk = Storage::disk($driver);
+            $file = $disk->putFileAs($base, new File($tmpName), $path, 'public');
+            $permalink = $disk->url($file);
+
+            $avatar->media_path = $base.'/'.$path;
+            $avatar->is_remote = true;
+            $avatar->cdn_url = $local ? config('app.url').$permalink : $permalink;
+            $avatar->size = $head['length'];
+            $avatar->change_count = $avatar->change_count + 1;
+            $avatar->last_fetched_at = now();
+            $avatar->save();
+
+            Cache::forget('avatar:'.$avatar->profile_id);
+            AccountService::del($avatar->profile_id);
+            AvatarStorageCleanup::dispatch($avatar)->onQueue($queue)->delay(now()->addMinutes(random_int(3, 15)));
+        } finally {
+            if (is_file($tmpName)) {
+                @unlink($tmpName);
+            }
+        }
+    }
+
+    public static function delete(Media $media, $confirm = false)
+    {
+        if (! $confirm) {
+            return;
+        }
+        MediaDeletePipeline::dispatch($media)->onQueue('mmo');
+    }
+
+    protected function cloudMove($media)
+    {
+        if (! Storage::exists($media->media_path)) {
+            return 'invalid file';
+        }
+
+        $path = storage_path('app/'.$media->media_path);
+        $thumb = null;
+        $thumbname = null;
+
+        if ($media->thumbnail_path) {
+            $thumb = storage_path('app/'.$media->thumbnail_path);
+            $pt = explode('/', $media->thumbnail_path);
+            $thumbname = array_pop($pt);
+        }
+
+        $p = explode('/', $media->media_path);
+        $name = array_pop($p);
+        $storagePath = implode('/', $p);
+
+        $url = ResilientMediaStorageService::store($storagePath, $path, $name);
+        if ($thumb) {
+            $thumbUrl = ResilientMediaStorageService::store($storagePath, $thumb, $thumbname);
+            $media->thumbnail_url = $thumbUrl;
+        }
+        $media->cdn_url = $url;
+        $media->optimized_url = $url;
+        $media->replicated_at = now();
+        $media->save();
+
+        if ($media->status_id) {
+            Cache::forget('pf:status:ap:v1:sid:'.$media->status_id);
+            Cache::forget('status:transformer:media:attachments:'.$media->status_id);
+            MediaService::del($media->status_id);
+            StatusService::del($media->status_id, false);
+        }
+
+        return 'success';
+    }
+}

@@ -1,0 +1,174 @@
+<?php
+
+namespace App\Http\Controllers\Auth;
+
+use App\Http\Controllers\Controller;
+use App\Services\BouncerService;
+use Illuminate\Auth\Events\PasswordReset;
+use Illuminate\Foundation\Auth\ResetsPasswords;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Password;
+use Illuminate\Support\Str;
+use Illuminate\Validation\Rules;
+use Illuminate\Validation\ValidationException;
+use Illuminate\View\View;
+
+class ResetPasswordController extends Controller
+{
+    /*
+    |--------------------------------------------------------------------------
+    | Password Reset Controller
+    |--------------------------------------------------------------------------
+    |
+    | This controller is responsible for handling password reset requests
+    | and uses a simple trait to include this behavior. You're free to
+    | explore this trait and override any methods you wish to tweak.
+    |
+    */
+
+    use ResetsPasswords;
+
+    /**
+     * Where to redirect users after resetting their password.
+     *
+     * @var string
+     */
+    protected $redirectTo = '/i/web';
+
+    /**
+     * Create a new controller instance.
+     *
+     * @return void
+     */
+    public function __construct()
+    {
+        $this->middleware('guest');
+    }
+
+    /**
+     * Get the password reset validation rules.
+     */
+    protected function rules(): array
+    {
+        usleep(random_int(100000, 3000000));
+
+        $rules = [
+            'token' => 'required',
+            'email' => 'required|email',
+            'password' => ['required', 'confirmed', 'max:72', Rules\Password::defaults()],
+        ];
+
+        if (app('captcha.manager')->activeOn('password_reset')) {
+            $rules[app('captcha.manager')->active()->responseField()] = ['required', 'filled', 'captcha_verify'];
+        }
+
+        return $rules;
+    }
+
+    /**
+     * Get the password reset validation error messages.
+     */
+    protected function validationErrorMessages(): array
+    {
+        $field = app('captcha.manager')->active()->responseField();
+
+        return [
+            'password.max' => 'Passwords should not exceed 72 characters.',
+            $field.'.required' => 'Failed to validate the captcha.',
+            $field.'.filled' => 'Failed to validate the captcha.',
+            $field.'.captcha_verify' => 'Failed to validate the captcha.',
+        ];
+    }
+
+    /**
+     * Display the password reset view for the given token.
+     *
+     * If no token is present, display the link request form.
+     */
+    public function showResetForm(Request $request): View
+    {
+        if (config('pixelfed.bouncer.cloud_ips.ban_logins')) {
+            abort_if(BouncerService::checkIp($request->ip()), 404);
+        }
+
+        usleep(random_int(100000, 300000));
+
+        $token = $request->route()->parameter('token');
+
+        return view('auth.passwords.reset')->with(
+            ['token' => $token, 'email' => $request->email]
+        );
+    }
+
+    public function reset(Request $request)
+    {
+        if (config('pixelfed.bouncer.cloud_ips.ban_logins')) {
+            abort_if(BouncerService::checkIp($request->ip()), 404);
+        }
+
+        $request->validate($this->rules(), $this->validationErrorMessages());
+
+        // Here we will attempt to reset the user's password. If it is successful we
+        // will update the password on an actual user model and persist it to the
+        // database. Otherwise we will parse the error and return the response.
+        $response = $this->broker()->reset(
+            $this->credentials($request),
+            function ($user, $password) {
+                $this->resetPassword($user, $password);
+            }
+        );
+
+        // If the password was successfully reset, we will redirect the user back to
+        // the application's home authenticated view. If there is an error we can
+        // redirect them back to where they came from with their error message.
+        return $response == Password::PASSWORD_RESET
+            ? $this->sendResetResponse($request, $response)
+            : $this->sendResetFailedResponse($request, $response);
+    }
+
+    /**
+     * Get the password reset credentials from the request.
+     *
+     * @return array
+     */
+    protected function credentials(Request $request)
+    {
+        return $request->only(
+            'email',
+            'password',
+            'password_confirmation',
+            'token'
+        );
+    }
+
+    /**
+     * Get the response for a failed password reset.
+     *
+     * @param  string  $response
+     */
+    protected function sendResetFailedResponse(Request $request, $response): RedirectResponse
+    {
+        if ($request->wantsJson()) {
+            throw ValidationException::withMessages(['email' => [trans($response)]]);
+        }
+
+        return redirect()->back()
+            ->withInput($request->only('email'))
+            ->withErrors(['email' => [trans($response)]]);
+    }
+
+    protected function resetPassword($user, $password): void
+    {
+        $this->setUserPassword($user, $password);
+        $user->setRememberToken(Str::random(60));
+        $user->save();
+
+        event(new PasswordReset($user));
+    }
+
+    protected function sendResetResponse(Request $request, $response): RedirectResponse
+    {
+        return redirect()->route('login')->with('status', trans($response));
+    }
+}

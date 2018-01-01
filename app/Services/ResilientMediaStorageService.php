@@ -1,0 +1,69 @@
+<?php
+
+namespace App\Services;
+
+use Aws\S3\Exception\S3Exception;
+use Exception;
+use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Exception\ConnectException;
+use Illuminate\Http\File;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use League\Flysystem\UnableToWriteFile;
+
+class ResilientMediaStorageService
+{
+    public static function store($storagePath, $path, $name)
+    {
+        return (bool) config_cache('pixelfed.cloud_storage') && (bool) config('media.storage.remote.resilient_mode') ?
+            self::handleResilientStore($storagePath, $path, $name) :
+            self::handleStore($storagePath, $path, $name);
+    }
+
+    public static function handleStore($storagePath, $path, $name)
+    {
+        return retry(3, function () use ($storagePath, $path, $name) {
+            $baseDisk = (bool) config_cache('pixelfed.cloud_storage') ? config('filesystems.cloud') : 'local';
+            $disk = Storage::disk($baseDisk);
+            $file = $disk->putFileAs($storagePath, new File($path), $name, 'public');
+
+            return $disk->url($file);
+        }, random_int(100, 500));
+    }
+
+    public static function handleResilientStore($storagePath, $path, $name)
+    {
+        return retry(4, function (int $attempt) use ($storagePath, $path, $name) {
+            usleep(100000);
+            $baseDisk = $attempt > 1 ? self::getAltDriver() : config('filesystems.cloud');
+            try {
+                $disk = Storage::disk($baseDisk);
+                $file = $disk->putFileAs($storagePath, new File($path), $name, 'public');
+
+                return $disk->url($file);
+            } catch (S3Exception|ClientException|ConnectException|UnableToWriteFile|Exception $e) {
+                Log::warning('ResilientMediaStorageService: Failed to handle Resilient Store : '.$e->getMessage());
+                throw $e;
+            }
+        }, function (int $attempt, Exception $exception) {
+            return $attempt * 200;
+        });
+    }
+
+    public static function getAltDriver()
+    {
+        $drivers = [];
+        if (config('filesystems.disks.alt-primary.enabled')) {
+            $drivers[] = 'alt-primary';
+        }
+        if (config('filesystems.disks.alt-secondary.enabled')) {
+            $drivers[] = 'alt-secondary';
+        }
+        if ($drivers === []) {
+            return false;
+        }
+        $key = array_rand($drivers, 1);
+
+        return $drivers[$key];
+    }
+}

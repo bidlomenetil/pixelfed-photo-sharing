@@ -1,0 +1,82 @@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+class NodeinfoService
+{
+    public static function get($domain)
+    {
+        $version = config('pixelfed.version');
+        $appUrl = config('app.url');
+        $headers = [
+            'Accept' => 'application/json',
+            'User-Agent' => "(Pixelfed/{$version}; +{$appUrl})",
+        ];
+
+        $url = 'https://'.$domain;
+        $wk = $url.'/.well-known/nodeinfo';
+
+        try {
+            $res = Http::withOptions([
+                'allow_redirects' => false,
+            ])
+                ->withHeaders($headers)
+                ->timeout(5)
+                ->get($wk);
+        } catch (RequestException|ConnectionException|\Exception $e) {
+            return false;
+        }
+
+        if (! $res) {
+            return false;
+        }
+
+        $json = $res->json();
+
+        if (! isset($json['links'])) {
+            return false;
+        }
+
+        if (is_array($json['links'])) {
+            if (isset($json['links']['href'])) {
+                $href = $json['links']['href'];
+            } elseif (isset($json['links'][0]['href'])) {
+                $href = $json['links'][0]['href'];
+            } else {
+                Log::debug('NodeinfoService: malformed links array', [
+                    'domain' => $domain,
+                    'links' => $json['links'],
+                ]);
+
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        $domain = parse_url($url, PHP_URL_HOST);
+        $hrefDomain = parse_url($href, PHP_URL_HOST);
+
+        if ($domain !== $hrefDomain) {
+            return false;
+        }
+
+        try {
+            $res = Http::withOptions([
+                'allow_redirects' => false,
+            ])
+                ->withHeaders($headers)
+                ->timeout(5)
+                ->get($href);
+        } catch (RequestException|ConnectionException|\Exception) {
+            return false;
+        }
+
+        return $res->json();
+    }
+}

@@ -1,0 +1,154 @@
+<?php
+
+namespace App\Jobs\StatusPipeline;
+
+use App\Jobs\MentionPipeline\MentionPipeline;
+use App\Models\Hashtag;
+use App\Models\Mention;
+use App\Models\StatusHashtag;
+use App\Services\AccountService;
+use App\Services\CustomEmojiService;
+use App\Services\StatusService;
+use App\Services\TrendingHashtagService;
+use App\Util\ActivityPub\Helpers;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+
+class StatusTagsPipeline implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $activity;
+
+    protected $status;
+
+    /**
+     * Create a new job instance.
+     *
+     * @return void
+     */
+    public function __construct($activity, $status)
+    {
+        $this->activity = $activity;
+        $this->status = $status;
+    }
+
+    /**
+     * Execute the job.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $res = $this->activity;
+        $status = $this->status;
+
+        // Verify status exists
+        if (! $status) {
+            Log::info('StatusTagsPipeline: Status no longer exists, skipping job');
+
+            return;
+        }
+
+        // Verify activity data exists
+        if (! $res || ! isset($res['tag'])) {
+            Log::info("StatusTagsPipeline: No tag data in activity for status {$status->id}, skipping job");
+
+            return;
+        }
+
+        if (isset($res['tag']['type'], $res['tag']['name'])) {
+            $res['tag'] = [$res['tag']];
+        }
+
+        $tags = collect($res['tag']);
+
+        // Emoji
+        $tags->filter(function ($tag) {
+            return $tag && isset($tag['id'], $tag['icon'], $tag['name'], $tag['type']) && $tag['type'] == 'Emoji';
+        })
+            ->map(function ($tag) {
+                CustomEmojiService::import($tag['id'], $this->status->id);
+            });
+
+        // Hashtags
+        $tags->filter(function ($tag) {
+            return $tag && $tag['type'] == 'Hashtag' && isset($tag['href'], $tag['name']);
+        })
+            ->map(function ($tag) use ($status) {
+                $name = str_starts_with($tag['name'], '#') ?
+                    substr($tag['name'], 1) : $tag['name'];
+
+                $banned = TrendingHashtagService::getBannedHashtagNames();
+
+                if (count($banned)) {
+                    if (in_array(strtolower($name), array_map('strtolower', $banned))) {
+                        return;
+                    }
+                }
+
+                // Resolve a slug that does not collide with a *different* name,
+                // so two distinct names sharing a base slug keep separate rows.
+                $baseSlug = Str::slug($name, '-', false);
+                $slug = $baseSlug;
+                $counter = 1;
+                while (Hashtag::where('slug', $slug)->where('name', '!=', $name)->exists()) {
+                    $slug = $baseSlug.'-'.$counter++;
+                }
+
+                // Keyed on the unique `name` column: firstOrCreate -> createOrFirst
+                // catches the unique-constraint violation and re-selects, so two
+                // workers racing the same brand-new hashtag resolve to one row
+                // instead of throwing (SQLSTATE 23505 on pgsql, 1062 on mysql).
+                $hashtag = Hashtag::firstOrCreate(
+                    ['name' => $name],
+                    ['slug' => $slug],
+                );
+
+                StatusHashtag::firstOrCreate([
+                    'status_id' => $status->id,
+                    'hashtag_id' => $hashtag->id,
+                    'profile_id' => $status->profile_id,
+                    'status_visibility' => $status->scope,
+                ]);
+            });
+
+        // Mentions
+        $tags->filter(function ($tag) {
+            return $tag &&
+                $tag['type'] == 'Mention' &&
+                isset($tag['href']) &&
+                str_starts_with($tag['href'], 'https://');
+        })
+            ->map(function ($tag) use ($status) {
+                if (Helpers::validateLocalUrl($tag['href'])) {
+                    $parts = explode('/', $tag['href']);
+                    if (! $parts) {
+                        return;
+                    }
+                    $pid = AccountService::usernameToId(end($parts));
+                    if (! $pid) {
+                        return;
+                    }
+                } else {
+                    $acct = Helpers::profileFetch($tag['href']);
+                    if (! $acct) {
+                        return;
+                    }
+                    $pid = $acct->id;
+                }
+                $mention = new Mention;
+                $mention->status_id = $status->id;
+                $mention->profile_id = $pid;
+                $mention->save();
+                MentionPipeline::dispatch($status, $mention);
+            });
+
+        StatusService::refresh($status->id);
+    }
+}

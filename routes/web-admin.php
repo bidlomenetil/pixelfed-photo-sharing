@@ -1,0 +1,216 @@
+<?php
+
+use App\Http\Controllers\Admin\AdminUserInviteController;
+use App\Http\Controllers\AdminController;
+use App\Http\Controllers\AdminCuratedRegisterController;
+use App\Http\Controllers\AdminShadowFilterController;
+use App\Http\Controllers\PageController;
+use Illuminate\Contracts\View\Factory;
+use Laravel\Horizon\Http\Controllers\HomeController as HorizonHomeController;
+use Laravel\Pulse\Pulse;
+
+// Laravel Pulse + Horizon dashboards, kept under `admin/*` so their routes can
+// never collide with the `{username}` profile catch-all in routes/web.php
+Route::domain(config('pixelfed.domain.app'))->middleware(['localization'])->group(function () {
+    Route::get(config('pulse.path', 'admin/pulse'), function (Pulse $pulse, Factory $view) {
+        return $view->make('pulse::dashboard');
+    })->middleware('pulse')->name('pulse');
+
+    Route::get(config('horizon.path'), [HorizonHomeController::class, 'index'])
+        ->middleware('horizon')
+        ->name('horizon.base');
+});
+
+Route::domain(config('pixelfed.domain.admin'))->prefix('i/admin')->middleware(['localization'])->group(function () {
+    Route::redirect('/', '/dashboard');
+    Route::redirect('timeline', config('app.url').'/timeline');
+    Route::get('settings/custom-css', [AdminController::class, 'customCss'])->name('admin.custom-css');
+    Route::post('settings/custom-css', [AdminController::class, 'saveCustomCss']);
+    Route::get('dashboard', [AdminController::class, 'home'])->name('admin.home');
+    Route::get('stats', [AdminController::class, 'stats'])->name('admin.stats');
+    Route::get('reports', [AdminController::class, 'reports'])->name('admin.reports');
+    Route::get('reports/show/{id}', [AdminController::class, 'showReport']);
+    Route::post('reports/show/{id}', [AdminController::class, 'updateReport']);
+    Route::post('reports/bulk', [AdminController::class, 'bulkUpdateReport']);
+    Route::get('reports/autospam/{id}', [AdminController::class, 'showSpam']);
+    Route::post('reports/autospam/sync', [AdminController::class, 'fixUncategorizedSpam']);
+    Route::post('reports/autospam/{id}', [AdminController::class, 'updateSpam']);
+    Route::get('reports/autospam', [AdminController::class, 'spam']);
+    Route::get('reports/appeals', [AdminController::class, 'appeals']);
+    Route::get('reports/appeal/{id}', [AdminController::class, 'showAppeal']);
+    Route::post('reports/appeal/{id}', [AdminController::class, 'updateAppeal']);
+    Route::get('reports/email-verifications', [AdminController::class, 'reportMailVerifications']);
+    Route::post('reports/email-verifications/ignore', [AdminController::class, 'reportMailVerifyIgnore']);
+    Route::post('reports/email-verifications/approve', [AdminController::class, 'reportMailVerifyApprove']);
+    Route::post('reports/email-verifications/clear-ignored', [AdminController::class, 'reportMailVerifyClearIgnored']);
+    Route::redirect('stories', '/stories/list');
+    Route::get('stories/list', [AdminController::class, 'stories'])->name('admin.stories');
+    Route::redirect('statuses', '/statuses/list');
+    Route::get('statuses/list', [AdminController::class, 'statuses'])->name('admin.statuses');
+    Route::get('statuses/show/{id}', [AdminController::class, 'showStatus']);
+    Route::redirect('profiles', '/i/admin/profiles/list');
+    Route::get('profiles/list', [AdminController::class, 'profiles'])->name('admin.profiles');
+    Route::get('profiles/edit/{id}', [AdminController::class, 'profileShow']);
+    Route::redirect('users', '/users/list');
+    Route::get('users/list', [AdminController::class, 'users'])->name('admin.users');
+    Route::get('users/show/{id}', [AdminController::class, 'userShow']);
+    Route::get('users/edit/{id}', [AdminController::class, 'userEdit']);
+    Route::post('users/edit/{id}', [AdminController::class, 'userEditSubmit']);
+    Route::get('users/activity/{id}', [AdminController::class, 'userActivity']);
+    Route::get('users/message/{id}', [AdminController::class, 'userMessage']);
+    Route::post('users/message/{id}', [AdminController::class, 'userMessageSend']);
+    Route::get('users/modtools/{id}', [AdminController::class, 'userModTools']);
+    Route::get('users/modlogs/{id}', [AdminController::class, 'userModLogs']);
+    Route::post('users/modlogs/{id}', [AdminController::class, 'userModLogsMessage']);
+    Route::post('users/modlogs/{id}/delete', [AdminController::class, 'userModLogDelete']);
+    Route::get('users/delete/{id}', [AdminController::class, 'userDelete']);
+    Route::post('users/delete/{id}', [AdminController::class, 'userDeleteProcess']);
+    Route::post('users/moderation/update', [AdminController::class, 'userModerate']);
+    Route::get('users/invites', [AdminUserInviteController::class, 'index'])->name('admin.users.invites.index');
+    Route::get('users/invites/create', [AdminUserInviteController::class, 'create'])->name('admin.users.invites.create');
+    Route::post('users/invites/create', [AdminUserInviteController::class, 'store'])->name('admin.users.invites.store');
+    Route::post('users/invites/expire/{invite:invite_code}', [AdminUserInviteController::class, 'expire'])->name('admin.users.invites.expire');
+    Route::get('media', [AdminController::class, 'media'])->name('admin.media');
+    Route::redirect('media/list', '/i/admin/media');
+    Route::get('media/show/{id}', [AdminController::class, 'mediaShow']);
+    Route::get('settings', [AdminController::class, 'settings'])->name('admin.settings');
+    Route::post('settings', [AdminController::class, 'settingsHomeStore']);
+    Route::get('settings/features', [AdminController::class, 'settingsFeatures'])->name('admin.settings.features');
+    Route::get('settings/pages', [AdminController::class, 'settingsPages'])->name('admin.settings.pages');
+    Route::get('settings/pages/edit', [PageController::class, 'edit'])->name('admin.settings.pages.edit');
+    Route::post('settings/pages/edit', [PageController::class, 'store']);
+    Route::post('settings/pages/delete', [PageController::class, 'delete']);
+    Route::post('settings/pages/create', [PageController::class, 'generatePage']);
+    Route::get('settings/maintenance', [AdminController::class, 'settingsMaintenance'])->name('admin.settings.maintenance');
+    Route::get('settings/backups', [AdminController::class, 'settingsBackups'])->name('admin.settings.backups');
+    Route::get('settings/storage', [AdminController::class, 'settingsStorage'])->name('admin.settings.storage');
+    Route::get('settings/system', [AdminController::class, 'settingsSystem'])->name('admin.settings.system');
+
+    Route::get('instances', [AdminController::class, 'instances'])->name('admin.instances');
+    Route::post('instances', [AdminController::class, 'instanceScan']);
+    Route::get('instances/show/{id}', [AdminController::class, 'instanceShow']);
+    Route::post('instances/edit/{id}', [AdminController::class, 'instanceEdit']);
+    Route::get('apps/home', [AdminController::class, 'appsHome'])->name('admin.apps');
+    Route::get('hashtags/home', [AdminController::class, 'hashtagsHome'])->name('admin.hashtags');
+    Route::get('discover/home', [AdminController::class, 'discoverHome'])->name('admin.discover');
+    Route::get('discover/category/create', [AdminController::class, 'discoverCreateCategory'])->name('admin.discover.create-category');
+    Route::post('discover/category/create', [AdminController::class, 'discoverCreateCategoryStore']);
+    Route::get('discover/category/edit/{id}', [AdminController::class, 'discoverCategoryEdit']);
+    Route::post('discover/category/edit/{id}', [AdminController::class, 'discoverCategoryUpdate']);
+    Route::post('discover/category/hashtag/create', [AdminController::class, 'discoveryCategoryTagStore'])->name('admin.discover.create-hashtag');
+
+    Route::get('messages/home', [AdminController::class, 'messagesHome'])->name('admin.messages');
+    Route::get('messages/show/{id}', [AdminController::class, 'messagesShow']);
+    Route::post('messages/mark-read', [AdminController::class, 'messagesMarkRead']);
+    Route::post('messages/show/{id}', [AdminController::class, 'messagesReply']);
+    Route::post('messages/preview/{id}', [AdminController::class, 'messagesReplyPreview']);
+    Route::redirect('site-news', '/i/admin/newsroom');
+    Route::get('newsroom', [AdminController::class, 'newsroomHome'])->name('admin.newsroom.home');
+    Route::get('newsroom/create', [AdminController::class, 'newsroomCreate'])->name('admin.newsroom.create');
+    Route::get('newsroom/edit/{id}', [AdminController::class, 'newsroomEdit']);
+    Route::post('newsroom/edit/{id}', [AdminController::class, 'newsroomUpdate']);
+    Route::delete('newsroom/edit/{id}', [AdminController::class, 'newsroomDelete']);
+    Route::post('newsroom/create', [AdminController::class, 'newsroomStore']);
+
+    Route::get('diagnostics/home', [AdminController::class, 'diagnosticsHome'])->name('admin.diagnostics');
+    Route::post('diagnostics/decrypt', [AdminController::class, 'diagnosticsDecrypt'])->name('admin.diagnostics.decrypt');
+    Route::get('custom-emoji/home', [AdminController::class, 'customEmojiHome'])->name('admin.custom-emoji');
+    Route::post('custom-emoji/toggle-active/{id}', [AdminController::class, 'customEmojiToggleActive']);
+    Route::get('custom-emoji/new', [AdminController::class, 'customEmojiAdd']);
+    Route::post('custom-emoji/new', [AdminController::class, 'customEmojiStore']);
+    Route::post('custom-emoji/delete/{id}', [AdminController::class, 'customEmojiDelete']);
+    Route::get('custom-emoji/duplicates/{id}', [AdminController::class, 'customEmojiShowDuplicates']);
+
+    Route::get('directory/home', [AdminController::class, 'directoryHome'])->name('admin.directory');
+
+    Route::get('autospam/home', [AdminController::class, 'autospamHome'])->name('admin.autospam');
+
+    Route::redirect('asf/', 'asf/home');
+    Route::get('asf/home', [AdminShadowFilterController::class, 'home']);
+    Route::get('asf/create', [AdminShadowFilterController::class, 'create']);
+    Route::get('asf/edit/{id}', [AdminShadowFilterController::class, 'edit']);
+    Route::post('asf/edit/{id}', [AdminShadowFilterController::class, 'storeEdit']);
+    Route::post('asf/create', [AdminShadowFilterController::class, 'store']);
+
+    Route::redirect('curated-onboarding/', 'curated-onboarding/home');
+    Route::get('curated-onboarding/home', [AdminCuratedRegisterController::class, 'index'])->name('admin.curated-onboarding');
+    Route::get('curated-onboarding/templates', [AdminCuratedRegisterController::class, 'templates'])->name('admin.curated-onboarding.templates');
+    Route::get('curated-onboarding/templates/create', [AdminCuratedRegisterController::class, 'templateCreate'])->name('admin.curated-onboarding.create-template');
+    Route::post('curated-onboarding/templates/create', [AdminCuratedRegisterController::class, 'templateStore']);
+    Route::get('curated-onboarding/templates/edit/{id}', [AdminCuratedRegisterController::class, 'templateEdit']);
+    Route::post('curated-onboarding/templates/edit/{id}', [AdminCuratedRegisterController::class, 'templateEditStore']);
+    Route::delete('curated-onboarding/templates/edit/{id}', [AdminCuratedRegisterController::class, 'templateDelete']);
+    Route::get('curated-onboarding/show/{id}/preview-details-message', [AdminCuratedRegisterController::class, 'previewDetailsMessageShow']);
+    Route::get('curated-onboarding/show/{id}/preview-message', [AdminCuratedRegisterController::class, 'previewMessageShow']);
+    Route::get('curated-onboarding/show/{id}', [AdminCuratedRegisterController::class, 'show']);
+
+    Route::prefix('api')->group(function () {
+        Route::get('stats', [AdminController::class, 'getStats']);
+        Route::get('accounts', [AdminController::class, 'getAccounts']);
+        Route::get('posts', [AdminController::class, 'getPosts']);
+        Route::get('instances', [AdminController::class, 'getInstances']);
+        Route::post('directory/save', [AdminController::class, 'directoryStore']);
+        Route::get('directory/initial-data', [AdminController::class, 'directoryInitialData']);
+        Route::get('directory/popular-posts', [AdminController::class, 'directoryGetPopularPosts']);
+        Route::post('directory/add-by-id', [AdminController::class, 'directoryGetAddPostByIdSearch']);
+        Route::delete('directory/banner-image', [AdminController::class, 'directoryDeleteBannerImage']);
+        Route::post('directory/submit', [AdminController::class, 'directoryHandleServerSubmission']);
+        Route::post('directory/testimonial/save', [AdminController::class, 'directorySaveTestimonial']);
+        Route::post('directory/testimonial/delete', [AdminController::class, 'directoryDeleteTestimonial']);
+        Route::post('directory/testimonial/update', [AdminController::class, 'directoryUpdateTestimonial']);
+        Route::get('hashtags/stats', [AdminController::class, 'hashtagsStats']);
+        Route::get('hashtags/query', [AdminController::class, 'hashtagsApi']);
+        Route::get('hashtags/get', [AdminController::class, 'hashtagsGet']);
+        Route::post('hashtags/update', [AdminController::class, 'hashtagsUpdate']);
+        Route::post('hashtags/clear-trending-cache', [AdminController::class, 'hashtagsClearTrendingCache']);
+        Route::get('instances/get', [AdminController::class, 'getInstancesApi']);
+        Route::get('instances/stats', [AdminController::class, 'getInstancesStatsApi']);
+        Route::get('instances/query', [AdminController::class, 'getInstancesQueryApi']);
+        Route::post('instances/update', [AdminController::class, 'postInstanceUpdateApi']);
+        Route::post('instances/create', [AdminController::class, 'postInstanceCreateNewApi']);
+        Route::post('instances/delete', [AdminController::class, 'postInstanceDeleteApi']);
+        Route::post('instances/refresh-stats', [AdminController::class, 'postInstanceRefreshStatsApi']);
+        Route::get('instances/download-backup', [AdminController::class, 'downloadBackup']);
+        Route::post('instances/import-data', [AdminController::class, 'importBackup']);
+        Route::get('reports/moderated-profiles', [AdminController::class, 'getModeratedProfiles']);
+        Route::post('reports/moderated-profiles/update', [AdminController::class, 'updateModeratedProfile']);
+        Route::post('reports/moderated-profiles/create', [AdminController::class, 'createModeratedProfile']);
+        Route::get('reports/moderated-profiles/show', [AdminController::class, 'getModeratedProfile']);
+        Route::post('reports/moderated-profiles/delete', [AdminController::class, 'deleteModeratedProfile']);
+        Route::get('reports/moderated-profiles/export', [AdminController::class, 'exportModeratedProfiles']);
+        Route::get('reports/stats', [AdminController::class, 'reportsStats']);
+        Route::get('reports/all', [AdminController::class, 'reportsApiAll']);
+        Route::get('reports/remote', [AdminController::class, 'reportsApiRemote']);
+        Route::post('reports/remote/handle', [AdminController::class, 'reportsApiRemoteHandle']);
+        Route::get('reports/get/{id}', [AdminController::class, 'reportsApiGet']);
+        Route::post('reports/handle', [AdminController::class, 'reportsApiHandle']);
+        Route::get('reports/spam/all', [AdminController::class, 'reportsApiSpamAll']);
+        Route::get('reports/spam/get/{id}', [AdminController::class, 'reportsApiSpamGet']);
+        Route::post('reports/spam/handle', [AdminController::class, 'reportsApiSpamHandle']);
+        Route::post('autospam/config', [AdminController::class, 'getAutospamConfigApi']);
+        Route::post('autospam/reports/closed', [AdminController::class, 'getAutospamReportsClosedApi']);
+        Route::post('autospam/train', [AdminController::class, 'postAutospamTrainSpamApi']);
+        Route::post('autospam/search/non-spam', [AdminController::class, 'postAutospamTrainNonSpamSearchApi']);
+        Route::post('autospam/train/non-spam', [AdminController::class, 'postAutospamTrainNonSpamSubmitApi']);
+        Route::post('autospam/tokens/custom', [AdminController::class, 'getAutospamCustomTokensApi']);
+        Route::post('autospam/tokens/store', [AdminController::class, 'saveNewAutospamCustomTokensApi']);
+        Route::post('autospam/tokens/update', [AdminController::class, 'updateAutospamCustomTokensApi']);
+        Route::post('autospam/tokens/export', [AdminController::class, 'exportAutospamCustomTokensApi']);
+        Route::post('autospam/config/enable', [AdminController::class, 'enableAutospamApi']);
+        Route::post('autospam/config/disable', [AdminController::class, 'disableAutospamApi']);
+        // Route::get('instances/{id}/accounts', [AdminController::class, 'getInstanceAccounts']);
+        Route::get('curated-onboarding/show/{id}/activity-log', [AdminCuratedRegisterController::class, 'apiActivityLog']);
+        Route::post('curated-onboarding/show/{id}/message/preview', [AdminCuratedRegisterController::class, 'apiMessagePreviewStore']);
+        Route::post('curated-onboarding/show/{id}/message/send', [AdminCuratedRegisterController::class, 'apiMessageSendStore']);
+        Route::post('curated-onboarding/show/{id}/reject', [AdminCuratedRegisterController::class, 'apiHandleReject']);
+        Route::post('curated-onboarding/show/{id}/approve', [AdminCuratedRegisterController::class, 'apiHandleApprove']);
+        Route::get('curated-onboarding/templates/get', [AdminCuratedRegisterController::class, 'getActiveTemplates']);
+        Route::get('settings/fetch', [AdminController::class, 'settingsApiFetch']);
+        Route::post('settings/rules/add', [AdminController::class, 'settingsApiRulesAdd']);
+        Route::post('settings/rules/delete', [AdminController::class, 'settingsApiRulesDelete']);
+        Route::post('settings/rules/delete/all', [AdminController::class, 'settingsApiRulesDeleteAll']);
+        Route::post('settings/autofollow/add', [AdminController::class, 'settingsApiAutofollowAdd']);
+        Route::post('settings/autofollow/delete', [AdminController::class, 'settingsApiAutofollowDelete']);
+        Route::post('settings/update/{type}', [AdminController::class, 'settingsApiUpdateType']);
+    });
+});

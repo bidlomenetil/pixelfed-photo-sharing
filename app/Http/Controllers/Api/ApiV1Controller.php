@@ -1,0 +1,5307 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\AccountController;
+use App\Http\Controllers\Controller;
+use App\Http\Controllers\FollowerController;
+use App\Http\Controllers\StatusController;
+use App\Jobs\AvatarPipeline\AvatarOptimize;
+use App\Jobs\CommentPipeline\CommentPipeline;
+use App\Jobs\FollowPipeline\FollowAcceptPipeline;
+use App\Jobs\FollowPipeline\FollowPipeline;
+use App\Jobs\FollowPipeline\FollowRejectPipeline;
+use App\Jobs\FollowPipeline\UnfollowPipeline;
+use App\Jobs\HomeFeedPipeline\FeedWarmCachePipeline;
+use App\Jobs\ImageOptimizePipeline\ImageOptimize;
+use App\Jobs\LikePipeline\LikePipeline;
+use App\Jobs\LikePipeline\UnlikePipeline;
+use App\Jobs\MediaPipeline\MediaDeletePipeline;
+use App\Jobs\MediaPipeline\MediaSyncLicensePipeline;
+use App\Jobs\NotificationPipeline\NotificationWarmUserCache;
+use App\Jobs\SharePipeline\SharePipeline;
+use App\Jobs\SharePipeline\UndoSharePipeline;
+use App\Jobs\StatusPipeline\NewStatusPipeline;
+use App\Jobs\StatusPipeline\StatusDelete;
+use App\Jobs\VideoPipeline\VideoThumbnail;
+use App\Models\Avatar;
+use App\Models\Bookmark;
+use App\Models\Collection;
+use App\Models\CollectionItem;
+use App\Models\CustomFilter;
+use App\Models\DmConversation;
+use App\Models\DmConversationParticipant;
+use App\Models\DmMessage;
+use App\Models\Follower;
+use App\Models\FollowRequest;
+use App\Models\Hashtag;
+use App\Models\Instance;
+use App\Models\Like;
+use App\Models\Media;
+use App\Models\Notification;
+use App\Models\Profile;
+use App\Models\Status;
+use App\Models\StatusHashtag;
+use App\Models\User;
+use App\Models\UserFilter;
+use App\Models\UserSetting;
+use App\Services\AccountService;
+use App\Services\AdminShadowFilterService;
+use App\Services\BookmarkService;
+use App\Services\BouncerService;
+use App\Services\CollectionService;
+use App\Services\CustomEmojiService;
+use App\Services\DirectMessagePayloadService;
+use App\Services\DirectMessageService;
+use App\Services\DiscoverService;
+use App\Services\FollowerService;
+use App\Services\HomeTimelineService;
+use App\Services\InstanceService;
+use App\Services\LikeService;
+use App\Services\MarkerService;
+use App\Services\MediaBlocklistService;
+use App\Services\MediaPathService;
+use App\Services\MediaService;
+use App\Services\NetworkTimelineService;
+use App\Services\NotificationService;
+use App\Services\PlaceService;
+use App\Services\PublicTimelineService;
+use App\Services\QuoteService;
+use App\Services\ReblogService;
+use App\Services\RelationshipService;
+use App\Services\SanitizeService;
+use App\Services\SnowflakeService;
+use App\Services\StatusService;
+use App\Services\StoryIndexService;
+use App\Services\UserFilterService;
+use App\Services\UserRoleService;
+use App\Services\UserStorageService;
+use App\Support\CursorToken;
+use App\Transformer\Api\Mastodon\v1\MediaTransformer;
+use App\Transformer\Api\Mastodon\v1\StatusTransformer;
+use App\Transformer\Api\RelationshipTransformer;
+use App\Util\Lexer\Autolink;
+use App\Util\Lexer\PrettyNumber;
+use App\Util\Localization\Localization;
+use App\Util\Media\Filter;
+use App\Util\Media\License;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Pagination\Cursor;
+use Illuminate\Pagination\CursorPaginator;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Laravel\Passport\Client;
+use League\Fractal;
+use League\Fractal\Serializer\ArraySerializer;
+
+class ApiV1Controller extends Controller
+{
+    protected $fractal;
+
+    const PF_API_ENTITY_KEY = '_pe';
+
+    /**
+     * How deep a home feed rebuild goes while a request is waiting for it.
+     * Several screens worth, rather than the full feed cap: the queued job
+     * takes it the rest of the way. Raising this means raising the warm
+     * lock's ttl with it.
+     */
+    const HOME_COLD_BOOT_DEPTH = 100;
+
+    public function __construct()
+    {
+        $this->fractal = new Fractal\Manager;
+        $this->fractal->setSerializer(new ArraySerializer);
+    }
+
+    public function json($res, $code = 200, $headers = []): JsonResponse
+    {
+        return response()->json($res, $code, $headers, JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * GET /api/v1/apps/verify_credentials
+     */
+    public function getApp(Request $request)
+    {
+        // FIXME: /api/v1/apps/verify_credentials should be accessible with any
+        // valid Access Token, not just a user's access token (i.e., client
+        // credentails grant flow access tokens)
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+
+        $client = $request->user()->token()->client;
+        $res = [
+            'name' => $client->name,
+            'website' => null,
+            'vapid_key' => null,
+        ];
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/apps
+     */
+    public function apps(Request $request)
+    {
+        abort_if(! (bool) config_cache('pixelfed.oauth_enabled'), 404);
+
+        $this->validate($request, [
+            'client_name' => 'required',
+            'redirect_uris' => 'required',
+        ]);
+
+        $uris = collect(explode("\n", $request->redirect_uris))
+            ->map('urldecode')
+            ->filter()
+            ->join(',');
+
+        $secret = Str::random(40);
+
+        $client = new Client;
+        $client->forceFill([
+            'user_id' => null,
+            'name' => e($request->client_name),
+            'secret' => $secret,
+            'redirect' => $uris,
+            'personal_access_client' => false,
+            'password_client' => false,
+            'revoked' => false,
+        ]);
+        $client->save();
+
+        $res = [
+            'id' => (string) $client->id,
+            'name' => $client->name,
+            'website' => null,
+            'redirect_uri' => $client->redirect,
+            'client_id' => (string) $client->id,
+            'client_secret' => $secret,
+            'vapid_key' => null,
+        ];
+
+        return $this->json($res, 200, [
+            'Access-Control-Allow-Origin' => '*',
+        ]);
+    }
+
+    /**
+     * GET /api/v1/accounts/verify_credentials
+     */
+    public function verifyCredentials(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $user = $request->user();
+
+        abort_if($user->status != null, 403);
+        AccountService::setLastActive($user->id);
+
+        $res = $request->has(self::PF_API_ENTITY_KEY) ? AccountService::get($user->profile_id) : AccountService::getMastodon($user->profile_id);
+
+        $res['source'] = [
+            'privacy' => $res['locked'] ? 'private' : 'public',
+            'sensitive' => false,
+            'language' => $user->language ?? 'en',
+            'note' => strip_tags($res['note']),
+            'fields' => [],
+        ];
+
+        if ($request->has(self::PF_API_ENTITY_KEY)) {
+            $res['settings'] = AccountService::getAccountSettings($user->profile_id);
+        }
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/accounts/{id}
+     *
+     * @param  int  $id
+     */
+    public function accountById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $withInstanceMeta = $request->has('_wim');
+        $res = $request->has(self::PF_API_ENTITY_KEY) ? AccountService::get($id, true) : AccountService::getMastodon($id, true);
+        if (! $res) {
+            return response()->json(['error' => 'Record not found'], 404);
+        }
+        if ($res && strpos($res['acct'], '@') != -1) {
+            $domain = parse_url($res['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/accounts/lookup
+     */
+    public function accountLookupById(Request $request)
+    {
+        $request->validate([
+            'acct' => 'required|string|min:3|max:100',
+        ]);
+
+        $acct = ltrim(trim($request->acct), '@');
+        $parts = explode('@', $acct);
+
+        if (count($parts) > 2 || $parts[0] === '') {
+            return $this->json(['error' => 'Record not found'], 400);
+        }
+
+        $username = $parts[0];
+        $domain = isset($parts[1]) ? strtolower($parts[1]) : null;
+        $localDomain = strtolower((string) parse_url(config('app.url'), PHP_URL_HOST));
+
+        if ($domain === '') {
+            return $this->json(['error' => 'Record not found'], 400);
+        }
+
+        $lookup = ($domain === null || $domain === $localDomain)
+            ? $username
+            : '@'.$username.'@'.$domain;
+
+        $profile = Profile::whereUsername($lookup)->first();
+
+        if (! $profile || $profile->status != null) {
+            return $this->json(['error' => 'Record not found'], 400);
+        }
+
+        $res = $request->has(self::PF_API_ENTITY_KEY) ? AccountService::get($profile->id, true) : AccountService::getMastodon($profile->id, true);
+        if (! $res) {
+            return response()->json(['error' => 'Record not found'], 404);
+        }
+        if (str_contains($res['acct'], '@')) {
+            $domain = parse_url($res['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        return $this->json($res);
+    }
+
+    /**
+     * PATCH /api/v1/accounts/update_credentials
+     */
+    public function accountUpdateCredentials(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        if (config('pixelfed.bouncer.cloud_ips.ban_api')) {
+            abort_if(BouncerService::checkIp($request->ip()), 404);
+        }
+
+        $this->validate($request, [
+            'avatar' => 'sometimes|mimetypes:image/jpeg,image/jpg,image/png|max:'.config('pixelfed.max_avatar_size'),
+            'display_name' => 'nullable|string|max:30',
+            'note' => 'nullable|string|max:200',
+            'locked' => 'nullable',
+            'website' => 'nullable|string|max:120',
+            // 'source.privacy'    => 'nullable|in:unlisted,public,private',
+            // 'source.sensitive'  => 'nullable|boolean'
+        ], [
+            'required' => 'The :attribute field is required.',
+            'avatar.mimetypes' => 'The file must be in jpeg or png format',
+            'avatar.max' => 'The :attribute exceeds the file size limit of '.PrettyNumber::size(config('pixelfed.max_avatar_size'), true, false),
+        ]);
+
+        $user = $request->user();
+        AccountService::setLastActive($user->id);
+        $profile = $user->profile;
+        $settings = $user->settings;
+
+        $changes = false;
+        $other = array_merge(AccountService::defaultSettings()['other'], $settings->other ?? []);
+        $syncLicenses = false;
+        $licenseChanged = false;
+        $composeSettings = array_merge(AccountService::defaultSettings()['compose_settings'], $settings->compose_settings ?? []);
+
+        if ($request->has('avatar')) {
+            $av = Avatar::whereProfileId($profile->id)->first();
+            if ($av) {
+                $currentAvatar = storage_path('app/'.$av->media_path);
+                $file = $request->file('avatar');
+                $path = "public/avatars/{$profile->id}";
+                $name = strtolower(Str::random(6)).'.'.$file->guessExtension();
+                $request->file('avatar')->storePubliclyAs($path, $name);
+                $av->media_path = "{$path}/{$name}";
+                $av->save();
+                Cache::forget("avatar:{$profile->id}");
+                Cache::forget('user:account:id:'.$user->id);
+                AvatarOptimize::dispatch($user->profile, $currentAvatar);
+            }
+            $changes = true;
+        }
+
+        if ($request->has('source.language')) {
+            $lang = $request->input('source.language');
+            if (in_array($lang, Localization::languages())) {
+                $user->language = $lang;
+                $changes = true;
+                $other['language'] = $lang;
+            }
+        }
+
+        if ($request->has('website')) {
+            $website = $request->input('website');
+            if ($website != $profile->website) {
+                if ($website) {
+                    // Validate URL scheme FIRST
+                    if (! Str::startsWith($website, ['http://', 'https://'])) {
+                        $website = null;
+                    } else {
+                        if (! strpos($website, '.')) {
+                            $website = null;
+                        }
+
+                        $host = parse_url($website, PHP_URL_HOST);
+
+                        $bannedInstances = InstanceService::getBannedDomains();
+                        if (in_array($host, $bannedInstances)) {
+                            $website = null;
+                        }
+                    }
+                }
+                $profile->website = $website;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('display_name')) {
+            $displayName = trim(
+                preg_replace('/[\x00-\x1F\x7F]/u', '', (string) $request->input('display_name'))
+            );
+            if ($displayName !== $user->name) {
+                $user->name = $displayName;
+                $profile->name = $displayName;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('note')) {
+            $note = $request->input('note');
+            if ($note !== strip_tags($profile->bio)) {
+                $profile->bio = Autolink::create()->autolink(strip_tags($note));
+                $changes = true;
+            }
+        }
+
+        if ($request->has('locked')) {
+            $locked = $request->boolean('locked');
+            if ($profile->is_private != $locked) {
+                $profile->is_private = $locked;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('reduce_motion')) {
+            $reduced = $request->boolean('reduce_motion');
+            if ($settings->reduce_motion != $reduced) {
+                $settings->reduce_motion = $reduced;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('high_contrast_mode')) {
+            $contrast = $request->boolean('high_contrast_mode');
+            if ($settings->high_contrast_mode != $contrast) {
+                $settings->high_contrast_mode = $contrast;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('video_autoplay')) {
+            $autoplay = $request->boolean('video_autoplay');
+            if ($settings->video_autoplay != $autoplay) {
+                $settings->video_autoplay = $autoplay;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('license')) {
+            $license = $request->input('license');
+            abort_if(! in_array($license, License::keys()), 422, 'Invalid media license id');
+            $syncLicenses = $request->boolean('sync_licenses');
+            abort_if($syncLicenses && Cache::get('pf:settings:mls_recently:'.$user->id) == 2, 422, 'You can only sync licenses twice per 24 hours');
+            if ($composeSettings['default_license'] != $license) {
+                $composeSettings['default_license'] = $license;
+                $licenseChanged = true;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('media_descriptions')) {
+            $md = $request->boolean('media_descriptions');
+            if ($composeSettings['media_descriptions'] != $md) {
+                $composeSettings['media_descriptions'] = $md;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('crawlable')) {
+            $crawlable = $request->boolean('crawlable');
+            if ($settings->crawlable != $crawlable) {
+                $settings->crawlable = $crawlable;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('show_profile_follower_count')) {
+            $show_profile_follower_count = $request->boolean('show_profile_follower_count');
+            if ($settings->show_profile_follower_count != $show_profile_follower_count) {
+                $settings->show_profile_follower_count = $show_profile_follower_count;
+                $changes = true;
+                Cache::forget('pf:acct-trans:hideFollowers:'.$profile->id);
+            }
+        }
+
+        if ($request->has('show_profile_following_count')) {
+            $show_profile_following_count = $request->boolean('show_profile_following_count');
+            if ($settings->show_profile_following_count != $show_profile_following_count) {
+                $settings->show_profile_following_count = $show_profile_following_count;
+                $changes = true;
+                Cache::forget('pf:acct-trans:hideFollowing:'.$profile->id);
+            }
+        }
+
+        if ($request->has('public_dm')) {
+            $public_dm = $request->boolean('public_dm');
+            if ($settings->public_dm != $public_dm) {
+                $settings->public_dm = $public_dm;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('source.privacy')) {
+            $scope = $request->input('source.privacy');
+            if (in_array($scope, ['public', 'private', 'unlisted'])) {
+                if ($composeSettings['default_scope'] != $scope) {
+                    $composeSettings['default_scope'] = $profile->is_private ? 'private' : $scope;
+                    $changes = true;
+                }
+            }
+        }
+
+        if ($request->has('disable_embeds')) {
+            $disabledEmbeds = $request->boolean('disable_embeds');
+            if ($other['disable_embeds'] != $disabledEmbeds) {
+                $other['disable_embeds'] = $disabledEmbeds;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('show_atom')) {
+            $showAtom = $request->boolean('show_atom');
+            if ($settings->show_atom != $showAtom) {
+                $settings->show_atom = $showAtom;
+                $changes = true;
+            }
+        }
+
+        if ($request->has('is_suggestable')) {
+            $isSuggestable = $request->boolean('is_suggestable');
+            if ($profile->is_suggestable != $isSuggestable) {
+                $profile->is_suggestable = $isSuggestable;
+                $changes = true;
+            }
+        }
+
+        if ($changes) {
+            $settings->other = $other;
+            $settings->compose_settings = $composeSettings;
+            $settings->save();
+            $user->save();
+            $profile->save();
+            Cache::forget('profile:settings:'.$profile->id);
+            Cache::forget('user:account:id:'.$profile->user_id);
+            Cache::forget('profile:follower_count:'.$profile->id);
+            Cache::forget('profile:following_count:'.$profile->id);
+            Cache::forget('profile:embed:'.$profile->id);
+            Cache::forget('profile:compose:settings:'.$user->id);
+            Cache::forget('profile:view:'.$profile->username);
+            Cache::forget('profile:atom:enabled:'.$profile->id);
+            Cache::forget('pfc:cached-user:wt:'.strtolower($profile->username));
+            Cache::forget('pfc:cached-user:wot:'.strtolower($profile->username));
+            Cache::forget('pf:acct:settings:hidden-followers:'.$profile->id);
+            Cache::forget('pf:acct:settings:hidden-following:'.$profile->id);
+            Cache::forget('pf:acct-trans:hideFollowing:'.$profile->id);
+            Cache::forget('pf:acct-trans:hideFollowers:'.$profile->id);
+            AccountService::del($user->profile_id);
+            AccountService::forgetAccountSettings($profile->id);
+        }
+
+        if ($syncLicenses && $licenseChanged) {
+            $key = 'pf:settings:mls_recently:'.$user->id;
+            $val = Cache::has($key) ? 2 : 1;
+            Cache::put($key, $val, 86400);
+            MediaSyncLicensePipeline::dispatch($user->id, $request->input('license'));
+        }
+
+        if ($request->has(self::PF_API_ENTITY_KEY)) {
+            $res = AccountService::get($user->profile_id, true);
+        } else {
+            $res = AccountService::getMastodon($user->profile_id, true);
+            $res['bio'] = strip_tags($res['note']);
+            $res = array_merge($res, $other);
+        }
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/accounts/{id}/followers
+     *
+     * @param  int  $id
+     */
+    public function accountFollowersById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $account = AccountService::get($id);
+        abort_if(! $account, 404);
+        abort_if(isset($account['moved'], $account['moved']['id']), 404, 'Account moved');
+        $pid = $request->user()->profile_id;
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+            'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+        ]);
+        $limit = $request->input('limit', 10);
+        if ($limit > 80) {
+            $limit = 80;
+        }
+        $max_id = $request->max_id;
+        $min_id = $request->min_id;
+
+        if (! $max_id && ! $min_id) {
+            $min_id = 0;
+        }
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+
+        if ($account && strpos($account['acct'], '@') != -1) {
+            $domain = parse_url($account['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        if (intval($pid) !== intval($account['id'])) {
+            if ($account['locked']) {
+                if (! FollowerService::follows($pid, $account['id'])) {
+                    return [];
+                }
+            }
+
+            if (AccountService::hiddenFollowers($id)) {
+                return [];
+            }
+
+            if ($request->has('page') && $request->user()->is_admin == false) {
+                $page = (int) $request->input('page');
+                if (($page * $limit) >= 100) {
+                    return [];
+                }
+            }
+        }
+        $dir = $min_id !== null ? '>' : '<';
+        $id = $min_id ?? $max_id;
+        if ($request->has('page')) {
+            $res = DB::table('followers')
+                ->select('id', 'profile_id', 'following_id')
+                ->whereFollowingId($account['id'])
+                ->where('id', $dir, $id)
+                ->orderByDesc('id')
+                ->simplePaginate($limit)
+                ->map(function ($follower) use ($napi) {
+                    return $napi ? AccountService::get($follower->profile_id, true) : AccountService::getMastodon($follower->profile_id, true);
+                })
+                ->filter(function ($account) {
+                    return $account && isset($account['id']);
+                })
+                ->values()
+                ->toArray();
+
+            return $this->json($res);
+        }
+
+        $paginator = DB::table('followers')
+            ->select('id', 'profile_id', 'following_id')
+            ->whereFollowingId($account['id'])
+            ->where('id', $dir, $id)
+            ->orderByDesc('id')
+            ->cursorPaginate($limit)
+            ->withQueryString();
+
+        $link = null;
+
+        if ($paginator->onFirstPage()) {
+            if ($paginator->hasMorePages()) {
+                $link = '<'.$paginator->nextPageUrl().'>; rel="prev"';
+            }
+        } else {
+            if ($paginator->previousPageUrl()) {
+                $link = '<'.$paginator->previousPageUrl().'>; rel="next"';
+            }
+
+            if ($paginator->hasMorePages()) {
+                $link .= ($link ? ', ' : '').'<'.$paginator->nextPageUrl().'>; rel="prev"';
+            }
+        }
+
+        $res = $paginator->map(function ($follower) use ($napi) {
+            return $napi ? AccountService::get($follower->profile_id, true) : AccountService::getMastodon($follower->profile_id, true);
+        })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values()
+            ->toArray();
+
+        $headers = isset($link) ? ['Link' => $link] : [];
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * GET /api/v1/accounts/{id}/following
+     *
+     * @param  int  $id
+     */
+    public function accountFollowingById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $account = AccountService::get($id);
+        abort_if(! $account, 404);
+        abort_if(isset($account['moved'], $account['moved']['id']), 404, 'Account moved');
+        $pid = $request->user()->profile_id;
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+            'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+        ]);
+        $limit = $request->input('limit', 10);
+        if ($limit > 80) {
+            $limit = 80;
+        }
+        $max_id = $request->max_id;
+        $min_id = $request->min_id;
+
+        if (! $max_id && ! $min_id) {
+            $min_id = 0;
+        }
+
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+
+        if ($account && strpos($account['acct'], '@') != -1) {
+            $domain = parse_url($account['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        if (intval($pid) !== intval($account['id'])) {
+            if ($account['locked']) {
+                if (! FollowerService::follows($pid, $account['id'])) {
+                    return [];
+                }
+            }
+
+            if (AccountService::hiddenFollowing($id)) {
+                return [];
+            }
+
+            if ($request->has('page') && $request->user()->is_admin == false) {
+                $page = (int) $request->input('page');
+                if (($page * $limit) >= 100) {
+                    return [];
+                }
+            }
+        }
+
+        $dir = $min_id !== null ? '>' : '<';
+        $id = $min_id ?? $max_id;
+        if ($request->has('page')) {
+            $res = DB::table('followers')
+                ->select('id', 'profile_id', 'following_id')
+                ->whereProfileId($account['id'])
+                ->where('id', $dir, $id)
+                ->orderByDesc('id')
+                ->simplePaginate($limit)
+                ->map(function ($follower) use ($napi) {
+                    return $napi ? AccountService::get($follower->following_id, true) : AccountService::getMastodon($follower->following_id, true);
+                })
+                ->filter(function ($account) {
+                    return $account && isset($account['id']);
+                })
+                ->values()
+                ->toArray();
+
+            return $this->json($res);
+        }
+
+        $paginator = DB::table('followers')
+            ->select('id', 'profile_id', 'following_id')
+            ->whereProfileId($account['id'])
+            ->where('id', $dir, $id)
+            ->orderByDesc('id')
+            ->cursorPaginate($limit)
+            ->withQueryString();
+
+        $link = null;
+
+        if ($paginator->onFirstPage()) {
+            if ($paginator->hasMorePages()) {
+                $link = '<'.$paginator->nextPageUrl().'>; rel="prev"';
+            }
+        } else {
+            if ($paginator->previousPageUrl()) {
+                $link = '<'.$paginator->previousPageUrl().'>; rel="next"';
+            }
+
+            if ($paginator->hasMorePages()) {
+                $link .= ($link ? ', ' : '').'<'.$paginator->nextPageUrl().'>; rel="prev"';
+            }
+        }
+
+        $res = $paginator->map(function ($follower) use ($napi) {
+            return $napi ? AccountService::get($follower->following_id, true) : AccountService::getMastodon($follower->following_id, true);
+        })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values()
+            ->toArray();
+
+        $headers = isset($link) ? ['Link' => $link] : [];
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * GET /api/v1/accounts/{id}/statuses
+     *
+     * @param  int  $id
+     */
+    public function accountStatusesById(Request $request, $id)
+    {
+        $user = $request->user();
+
+        abort_if(! $user || ! $user->token(), 403);
+        abort_unless($user->tokenCan('read'), 403);
+        abort_if(! $user->profile_id, 403);
+
+        $this->validate($request, [
+            'only_media' => 'nullable',
+            'media_type' => 'sometimes|string|in:photo,video',
+            'pinned' => 'nullable',
+            'exclude_replies' => 'nullable',
+            'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'since_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'limit' => 'nullable|integer|min:1|max:100',
+            'only_reposts' => 'nullable',
+        ]);
+
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+
+        $profile = $napi
+            ? AccountService::get($id, true)
+            : AccountService::getMastodon($id, true);
+
+        if (! $profile || ! isset($profile['id'])) {
+            return $this->json(['error' => 'Account not found'], 404);
+        }
+
+        if (data_get($profile, 'moved.id') !== null) {
+            return $this->json([]);
+        }
+
+        if (str_contains($profile['acct'] ?? '', '@')) {
+            $domain = parse_url($profile['url'] ?? '', PHP_URL_HOST);
+
+            if (
+                $domain &&
+                in_array($domain, InstanceService::getBannedDomains(), true)
+            ) {
+                abort(404);
+            }
+        }
+
+        $profileId = (int) $profile['id'];
+        $viewerId = (int) $user->profile_id;
+
+        if ($profileId <= 0) {
+            return $this->json(['error' => 'Account not found'], 404);
+        }
+
+        $isOwner = $viewerId === $profileId;
+
+        $limit = (int) $request->input('limit', 20);
+
+        $onlyReposts = $request->boolean('only_reposts');
+        $onlyMedia = $request->boolean('only_media')
+            || $request->filled('media_type');
+
+        $mediaType = $request->input('media_type');
+        $excludeReplies = $request->boolean('exclude_replies');
+        $pinnedOnly = $request->boolean('pinned');
+
+        $isFollowing = false;
+
+        if (! $isOwner) {
+            $isFollowing = FollowerService::follows(
+                (string) $viewerId,
+                (string) $profileId
+            );
+
+            if (($profile['locked'] ?? false) && ! $isFollowing) {
+                return $this->json([]);
+            }
+        }
+
+        $allowedScopes = ($isOwner || $isFollowing)
+            ? ['public', 'unlisted', 'private']
+            : ['public', 'unlisted'];
+
+        $query = Status::query()
+            ->select([
+                'id',
+                'reblog_of_id',
+            ])
+            ->where('profile_id', $profileId)
+            ->whereIn('scope', $allowedScopes);
+
+        if ($excludeReplies) {
+            $query->whereNull('in_reply_to_id');
+        }
+
+        if ($pinnedOnly) {
+            $query->whereNotNull('pinned_order');
+        }
+
+        if ($onlyReposts) {
+            $query
+                ->whereNotNull('reblog_of_id')
+                ->where('type', 'share');
+        } else {
+            $query->whereNull('reblog_of_id');
+
+            if ($onlyMedia) {
+                $mediaTypes = match ($mediaType) {
+                    'photo' => [
+                        'photo',
+                        'photo:album',
+                        'photo:video:album',
+                    ],
+                    'video' => [
+                        'video',
+                        'video:album',
+                        'photo:video:album',
+                        'loop',
+                    ],
+                    default => [
+                        'photo',
+                        'photo:album',
+                        'video',
+                        'video:album',
+                        'photo:video:album',
+                        'loop',
+                    ],
+                };
+
+                $query->whereIn('type', $mediaTypes);
+            } else {
+                $types = [
+                    'text',
+                    'photo',
+                    'photo:album',
+                    'video',
+                    'video:album',
+                    'photo:video:album',
+                    'loop',
+                    'reply',
+                    'poll',
+                ];
+
+                $query->where(function ($q) use ($types) {
+                    $q->whereIn('type', $types)
+                        ->orWhereNull('type');
+                });
+            }
+        }
+
+        $minId = (int) $request->input('min_id', 0);
+        $sinceId = (int) $request->input('since_id', 0);
+        $maxId = (int) $request->input('max_id', 0);
+
+        $lowerBound = max($minId, $sinceId);
+
+        if ($lowerBound > 0) {
+            $query->where('id', '>', $lowerBound);
+        }
+
+        if ($maxId > 0) {
+            $query->where('id', '<', $maxId);
+        }
+
+        $scanLimit = min(200, max(20, $limit * 2));
+
+        $rows = $query
+            ->orderByDesc('id')
+            ->limit($scanLimit + 1)
+            ->toBase()
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return $this->json([]);
+        }
+
+        $result = [];
+        $resultInteractionIds = [];
+
+        $scanned = 0;
+        $lastScannedId = null;
+
+        foreach ($rows as $row) {
+            if ($scanned >= $scanLimit) {
+                break;
+            }
+
+            $scanned++;
+
+            $statusId = (int) $row->id;
+            $lastScannedId = $statusId;
+
+            try {
+                $status = $napi
+                    ? StatusService::get(
+                        $statusId,
+                        false,
+                        false,
+                        $viewerId
+                    )
+                    : StatusService::getMastodon(
+                        $statusId,
+                        false,
+                        $viewerId
+                    );
+            } catch (\Throwable $e) {
+                Log::warning(
+                    'Failed to serialize account status',
+                    [
+                        'status_id' => $statusId,
+                        'profile_id' => $profileId,
+                        'exception' => $e::class,
+                        'message' => $e->getMessage(),
+                    ]
+                );
+
+                continue;
+            }
+
+            if (! $status || ! isset($status['account']['id'])) {
+                continue;
+            }
+
+            if ((int) $status['account']['id'] !== $profileId) {
+                continue;
+            }
+
+            if (! in_array(
+                $status['visibility'] ?? null,
+                $allowedScopes,
+                true
+            )) {
+                continue;
+            }
+
+            $interactionId = $statusId;
+
+            if ($onlyReposts) {
+                $reblogId = (int) $row->reblog_of_id;
+
+                if ($reblogId <= 0) {
+                    continue;
+                }
+
+                try {
+                    $reblog = $napi
+                        ? StatusService::get(
+                            $reblogId,
+                            false,
+                            false,
+                            $viewerId
+                        )
+                        : StatusService::getMastodon(
+                            $reblogId,
+                            false,
+                            $viewerId
+                        );
+                } catch (\Throwable $e) {
+                    Log::warning(
+                        'Failed to serialize repost target',
+                        [
+                            'status_id' => $statusId,
+                            'reblog_id' => $reblogId,
+                            'exception' => $e::class,
+                            'message' => $e->getMessage(),
+                        ]
+                    );
+
+                    continue;
+                }
+
+                if (
+                    ! $reblog ||
+                    ! isset($reblog['account']['id']) ||
+                    ! in_array(
+                        $reblog['visibility'] ?? null,
+                        ['public', 'unlisted'],
+                        true
+                    )
+                ) {
+                    continue;
+                }
+
+                $status['reblog'] = $reblog;
+                $interactionId = $reblogId;
+            }
+
+            $status['account'] = $profile;
+
+            $result[] = $status;
+            $resultInteractionIds[] = $interactionId;
+
+            if (count($result) >= $limit) {
+                break;
+            }
+        }
+
+        if (! empty($result)) {
+            $interactionIds = array_values(
+                array_unique($resultInteractionIds)
+            );
+
+            $liked = [];
+            $reblogged = [];
+            $bookmarked = [];
+
+            $likedIds = DB::table('likes')
+                ->where('profile_id', $viewerId)
+                ->whereIn('status_id', $interactionIds)
+                ->pluck('status_id');
+
+            foreach ($likedIds as $statusId) {
+                $liked[(int) $statusId] = true;
+            }
+
+            $rebloggedIds = DB::table('statuses')
+                ->where('profile_id', $viewerId)
+                ->whereIn('reblog_of_id', $interactionIds)
+                ->whereNull('deleted_at')
+                ->pluck('reblog_of_id');
+
+            foreach ($rebloggedIds as $statusId) {
+                $reblogged[(int) $statusId] = true;
+            }
+
+            $bookmarkedIds = DB::table('bookmarks')
+                ->where('profile_id', $viewerId)
+                ->whereIn('status_id', $interactionIds)
+                ->pluck('status_id');
+
+            foreach ($bookmarkedIds as $statusId) {
+                $bookmarked[(int) $statusId] = true;
+            }
+
+            foreach ($result as $index => &$status) {
+                $interactionId = $resultInteractionIds[$index];
+
+                $status['favourited'] = isset($liked[$interactionId]);
+                $status['reblogged'] = isset($reblogged[$interactionId]);
+                $status['bookmarked'] = isset($bookmarked[$interactionId]);
+            }
+
+            unset($status);
+        }
+
+        $headers = [];
+
+        if (
+            $lastScannedId !== null &&
+            $scanned < $rows->count()
+        ) {
+            $params = $request->query();
+
+            $params['max_id'] = (string) $lastScannedId;
+            $params['limit'] = $limit;
+
+            $nextUrl = $request->url()
+                .'?'
+                .http_build_query($params);
+
+            $headers['Link'] = '<'.$nextUrl.'>; rel="next"';
+        }
+
+        return $this->json($result, 200, $headers);
+    }
+
+    /**
+     * POST /api/v1/accounts/{id}/follow
+     *
+     * @param  int  $id
+     */
+    public function accountFollowById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('follow'), 403);
+
+        $user = $request->user();
+        abort_if($user->profile_id == $id, 400, 'Invalid profile');
+
+        abort_if($user->has_roles && ! UserRoleService::can('can-follow', $user->id), 403, 'Invalid permissions for this action');
+
+        AccountService::setLastActive($user->id);
+
+        $target = Profile::whereNull('status')->findOrFail($id);
+
+        abort_if($target && $target->moved_to_profile_id, 400, 'Cannot follow an account that has moved!');
+
+        if ($target && $target->domain) {
+            $domain = $target->domain;
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        $private = (bool) $target->is_private;
+        $remote = (bool) $target->domain;
+        $blocked = UserFilter::whereUserId($target->id)
+            ->whereFilterType('block')
+            ->whereFilterableId($user->profile_id)
+            ->whereIn('filterable_type', ['App\Profile', Profile::class])
+            ->exists();
+
+        if ($blocked == true) {
+            abort(400, 'You cannot follow this user.');
+        }
+
+        $isFollowing = Follower::whereProfileId($user->profile_id)
+            ->whereFollowingId($target->id)
+            ->exists();
+
+        // Following already, return empty relationship
+        if ($isFollowing == true) {
+            $res = RelationshipService::get($user->profile_id, $target->id) ?? [];
+
+            return $this->json($res);
+        }
+
+        // Rate limits, max 7500 followers per account
+        if ($user->profile->following_count && $user->profile->following_count >= Follower::MAX_FOLLOWING) {
+            abort(400, 'You cannot follow more than '.Follower::MAX_FOLLOWING.' accounts');
+        }
+
+        if ($private === true) {
+            $follow = FollowRequest::firstOrCreate([
+                'follower_id' => $user->profile_id,
+                'following_id' => $target->id,
+            ]);
+            if ($remote === true && config('federation.activitypub.remoteFollow') == true) {
+                (new FollowerController)->sendFollow($user->profile, $target);
+            }
+        } elseif ($remote === true) {
+            $follow = FollowRequest::firstOrCreate([
+                'follower_id' => $user->profile_id,
+                'following_id' => $target->id,
+            ]);
+
+            if (config('federation.activitypub.remoteFollow') == true) {
+                (new FollowerController)->sendFollow($user->profile, $target);
+            }
+        } else {
+            $follower = Follower::firstOrCreate([
+                'profile_id' => $user->profile_id,
+                'following_id' => $target->id,
+            ]);
+            FollowPipeline::dispatch($follower)->onQueue('high');
+        }
+
+        RelationshipService::refresh($user->profile_id, $target->id);
+        Cache::forget('profile:following:'.$target->id);
+        Cache::forget('profile:followers:'.$target->id);
+        Cache::forget('profile:following:'.$user->profile_id);
+        Cache::forget('profile:followers:'.$user->profile_id);
+        Cache::forget('api:local:exp:rec:'.$user->profile_id);
+        Cache::forget('user:account:id:'.$target->user_id);
+        Cache::forget('user:account:id:'.$user->id);
+        Cache::forget('profile:follower_count:'.$target->id);
+        Cache::forget('profile:follower_count:'.$user->profile_id);
+        Cache::forget('profile:following_count:'.$target->id);
+        Cache::forget('profile:following_count:'.$user->profile_id);
+        AccountService::del($user->profile_id);
+        AccountService::del($target->id);
+
+        $res = RelationshipService::get($user->profile_id, $target->id);
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/accounts/{id}/unfollow
+     *
+     * @param  int  $id
+     */
+    public function accountUnfollowById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('follow'), 403);
+
+        $user = $request->user();
+
+        abort_if($user->profile_id == $id, 400, 'Invalid profile');
+
+        AccountService::setLastActive($user->id);
+
+        $target = Profile::whereNull('status')
+            ->findOrFail($id);
+
+        $private = (bool) $target->is_private;
+        $remote = (bool) $target->domain;
+
+        $isFollowing = Follower::whereProfileId($user->profile_id)
+            ->whereFollowingId($target->id)
+            ->exists();
+
+        if ($isFollowing == false) {
+            $followRequest = FollowRequest::whereFollowerId($user->profile_id)
+                ->whereFollowingId($target->id)
+                ->first();
+            if ($followRequest) {
+                $followRequest->delete();
+                RelationshipService::refresh($target->id, $user->profile_id);
+                if ($target->domain) {
+                    UnfollowPipeline::dispatch($user->profile_id, $target->id)->onQueue('high');
+                }
+            }
+            $resource = new Fractal\Resource\Item($target, new RelationshipTransformer);
+            $res = $this->fractal->createData($resource)->toArray();
+
+            return $this->json($res);
+        }
+
+        Follower::whereProfileId($user->profile_id)
+            ->whereFollowingId($target->id)
+            ->delete();
+
+        app(StoryIndexService::class)->removeFollowing((int) $user->profile_id, (int) $target->id);
+
+        UnfollowPipeline::dispatch($user->profile_id, $target->id)->onQueue('high');
+
+        if ($remote === true && config('federation.activitypub.remoteFollow') == true) {
+            (new FollowerController)->sendUndoFollow($user->profile, $target);
+        }
+
+        RelationshipService::refresh($user->profile_id, $target->id);
+        Cache::forget('profile:following:'.$target->id);
+        Cache::forget('profile:followers:'.$target->id);
+        Cache::forget('profile:following:'.$user->profile_id);
+        Cache::forget('profile:followers:'.$user->profile_id);
+        Cache::forget('api:local:exp:rec:'.$user->profile_id);
+        Cache::forget('user:account:id:'.$target->user_id);
+        Cache::forget('user:account:id:'.$user->id);
+        Cache::forget('profile:follower_count:'.$target->id);
+        Cache::forget('profile:follower_count:'.$user->profile_id);
+        Cache::forget('profile:following_count:'.$target->id);
+        Cache::forget('profile:following_count:'.$user->profile_id);
+        AccountService::del($user->profile_id);
+        AccountService::del($target->id);
+
+        $res = RelationshipService::get($user->profile_id, $target->id);
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/accounts/relationships
+     */
+    public function accountRelationshipsById(Request $request)
+    {
+        abort_if(! $request->user(), 403);
+
+        $this->validate($request, [
+            'id' => 'required|array|min:1',
+            'id.*' => 'required|integer|min:1|max:'.PHP_INT_MAX,
+        ]);
+        $ids = $request->input('id');
+        if (count($ids) > 20) {
+            $ids = collect($ids)->take(20)->toArray();
+        }
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+        $pid = $request->user()->profile_id ?? $request->user()->profile->id;
+        $res = collect($ids)
+            ->map(function ($id) use ($pid, $napi) {
+                if (intval($id) === intval($pid)) {
+                    return [
+                        'id' => $id,
+                        'following' => false,
+                        'followed_by' => false,
+                        'blocking' => false,
+                        'muting' => false,
+                        'muting_notifications' => false,
+                        'requested' => false,
+                        'domain_blocking' => false,
+                        'showing_reblogs' => false,
+                        'endorsed' => false,
+                    ];
+                }
+
+                return $napi ?
+                    RelationshipService::getWithDate($pid, $id) :
+                    RelationshipService::get($pid, $id);
+            });
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/accounts/search
+     */
+    public function accountSearch(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'q' => 'required|string|min:1|max:30',
+            'limit' => 'nullable|integer|min:1',
+            'resolve' => 'nullable',
+        ]);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-view-discover', $user->id), 403, 'Invalid permissions for this action');
+
+        AccountService::setLastActive($user->id);
+        $query = $request->input('q');
+        $limit = $request->input('limit') ?? 20;
+        if ($limit > 20) {
+            $limit = 20;
+        }
+        $resolve = $request->boolean('resolve', false);
+        $q = $query.'%';
+
+        $profiles = Profile::where('username', 'like', $q)
+            ->orderByDesc('followers_count')
+            ->limit($limit)
+            ->pluck('id')
+            ->map(function ($id) {
+                return AccountService::getMastodon($id);
+            })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values();
+
+        return $this->json($profiles);
+    }
+
+    /**
+     * GET /api/v1/blocks
+     */
+    public function accountBlocks(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+            'page' => 'sometimes|integer|min:1',
+        ]);
+
+        $user = $request->user();
+        $limit = $request->input('limit') ?? 40;
+        if ($limit > 80) {
+            $limit = 80;
+        }
+
+        $blocks = UserFilter::select('filterable_id', 'filterable_type', 'filter_type', 'user_id')
+            ->whereUserId($user->profile_id)
+            ->whereIn('filterable_type', ['App\Profile', Profile::class])
+            ->whereFilterType('block')
+            ->orderByDesc('id')
+            ->simplePaginate($limit)
+            ->withQueryString();
+
+        $res = $blocks->pluck('filterable_id')
+            ->map(function ($id) {
+                return AccountService::get($id, true);
+            })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values();
+
+        $baseUrl = config('app.url').'/api/v1/blocks?limit='.$limit.'&';
+        $next = $blocks->nextPageUrl();
+        $prev = $blocks->previousPageUrl();
+
+        if ($next && ! $prev) {
+            $link = '<'.$next.'>; rel="next"';
+        }
+
+        if (! $next && $prev) {
+            $link = '<'.$prev.'>; rel="prev"';
+        }
+
+        if ($next && $prev) {
+            $link = '<'.$next.'>; rel="next",<'.$prev.'>; rel="prev"';
+        }
+        $headers = isset($link) ? ['Link' => $link] : [];
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * POST /api/v1/accounts/{id}/block
+     *
+     * @param  int  $id
+     */
+    public function accountBlockById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        $pid = $user->profile_id ?? $user->profile->id;
+        AccountService::setLastActive($user->id);
+
+        if (intval($id) === intval($pid)) {
+            abort(400, 'You cannot block yourself');
+        }
+
+        $profile = Profile::findOrFail($id);
+
+        abort_if($profile->moved_to_profile_id, 422, 'Cannot block an account that has migrated!');
+
+        if ($profile->user && $profile->user->is_admin == true) {
+            abort(400, 'You cannot block an admin');
+        }
+
+        $count = UserFilterService::blockCount($pid);
+        $maxLimit = (int) config_cache('instance.user_filters.max_user_blocks');
+        if ($count === 0) {
+            $filterCount = UserFilter::whereUserId($pid)
+                ->whereFilterType('block')
+                ->get()
+                ->map(function ($rec) {
+                    return AccountService::get($rec->filterable_id, true);
+                })
+                ->filter(function ($account) {
+                    return $account && isset($account['id']);
+                })
+                ->values()
+                ->count();
+            abort_if($filterCount >= $maxLimit, 422, AccountController::FILTER_LIMIT_BLOCK_TEXT.$maxLimit.' accounts');
+        } else {
+            abort_if($count >= $maxLimit, 422, AccountController::FILTER_LIMIT_BLOCK_TEXT.$maxLimit.' accounts');
+        }
+
+        $followed = Follower::whereProfileId($profile->id)->whereFollowingId($pid)->first();
+        if ($followed) {
+            $followed->delete();
+            $profile->following_count = Follower::whereProfileId($profile->id)->count();
+            $profile->save();
+            $selfProfile = $user->profile;
+            $selfProfile->followers_count = Follower::whereFollowingId($pid)->count();
+            $selfProfile->save();
+            FollowerService::remove($profile->id, $pid);
+            AccountService::del($pid);
+            AccountService::del($profile->id);
+        }
+
+        $following = Follower::whereProfileId($pid)->whereFollowingId($profile->id)->first();
+        if ($following) {
+            $following->delete();
+            $profile->followers_count = Follower::whereFollowingId($profile->id)->count();
+            $profile->save();
+            $selfProfile = $user->profile;
+            $selfProfile->following_count = Follower::whereProfileId($pid)->count();
+            $selfProfile->save();
+            FollowerService::remove($pid, $profile->id);
+            AccountService::del($pid);
+            AccountService::del($profile->id);
+        }
+
+        Notification::whereProfileId($pid)
+            ->whereActorId($profile->id)
+            ->get()
+            ->map(function ($n) use ($pid) {
+                NotificationService::del($pid, $n['id']);
+                $n->forceDelete();
+            });
+
+        $filter = UserFilter::firstOrCreate([
+            'user_id' => $pid,
+            'filterable_id' => $profile->id,
+            'filterable_type' => Profile::class,
+            'filter_type' => 'block',
+        ]);
+
+        UserFilterService::block($pid, $id);
+        RelationshipService::refresh($pid, $id);
+        $resource = new Fractal\Resource\Item($profile, new RelationshipTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/accounts/{id}/unblock
+     *
+     * @param  int  $id
+     */
+    public function accountUnblockById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        $pid = $user->profile_id ?? $user->profile->id;
+        AccountService::setLastActive($user->id);
+
+        if (intval($id) === intval($pid)) {
+            abort(400, 'You cannot unblock yourself');
+        }
+
+        $profile = Profile::findOrFail($id);
+
+        abort_if($profile->moved_to_profile_id, 422, 'Cannot unblock an account that has migrated!');
+
+        $filter = UserFilter::whereUserId($pid)
+            ->whereFilterableId($profile->id)
+            ->whereIn('filterable_type', ['App\Profile', Profile::class])
+            ->whereFilterType('block')
+            ->first();
+
+        if ($filter) {
+            $filter->delete();
+            UserFilterService::unblock($pid, $profile->id);
+        }
+        RelationshipService::refresh($pid, $id);
+
+        $resource = new Fractal\Resource\Item($profile, new RelationshipTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/custom_emojis
+     *
+     * Return custom emoji
+     */
+    public function customEmojis(): Response
+    {
+        return response(CustomEmojiService::all())->header('Content-Type', 'application/json');
+    }
+
+    /**
+     * GET /api/v1/domain_blocks
+     *
+     * Return empty array
+     */
+    public function accountDomainBlocks(Request $request): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return response()->json([]);
+    }
+
+    /**
+     * GET /api/v1/endorsements
+     *
+     * Return empty array
+     */
+    public function accountEndorsements(Request $request): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return response()->json([]);
+    }
+
+    /**
+     * GET /api/v1/favourites
+     *
+     * Returns collection of liked statuses
+     */
+    public function accountFavourites(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+        ]);
+
+        $user = $request->user();
+        $maxId = $request->input('max_id');
+        $minId = $request->input('min_id');
+        $limit = $request->input('limit') ?? 10;
+        if ($limit > 40) {
+            $limit = 40;
+        }
+
+        $res = Like::whereProfileId($user->profile_id)
+            ->when($maxId, function ($q, $maxId) {
+                return $q->where('id', '<', $maxId);
+            })
+            ->when($minId, function ($q, $minId) {
+                return $q->where('id', '>', $minId);
+            })
+            ->orderByDesc('id')
+            ->limit($limit)
+            ->get()
+            ->map(function ($like) {
+                $status = StatusService::getMastodon($like['status_id'], false);
+                $status['favourited'] = true;
+                $status['like_id'] = $like->id;
+                $status['liked_at'] = str_replace('+00:00', 'Z', $like->created_at->format(DATE_RFC3339_EXTENDED));
+
+                return $status;
+            })
+            ->filter(function ($status) {
+                return $status && isset($status['id'], $status['like_id']);
+            })
+            ->values();
+
+        if ($res->count()) {
+            $ids = $res->map(function ($status) {
+                return $status['like_id'];
+            })->filter();
+
+            $max = $ids->min();
+            $min = $ids->max();
+
+            $baseUrl = config('app.url').'/api/v1/favourites?limit='.$limit.'&';
+            if ($maxId) {
+                $link = '<'.$baseUrl.'max_id='.$max.'>; rel="next",<'.$baseUrl.'min_id='.$min.'>; rel="prev"';
+            } else {
+                $link = '<'.$baseUrl.'max_id='.$max.'>; rel="next"';
+            }
+
+            return $this->json($res, 200, ['Link' => $link]);
+        }
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/statuses/{id}/favourite
+     *
+     * @param  int  $id
+     */
+    public function statusFavouriteById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-like', $user->id), 403, 'Invalid permissions for this action');
+
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+        $status = $napi ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
+
+        abort_unless($status, 404);
+        abort_if(isset($status['moved'], $status['moved']['id']), 422, 'Cannot like a post from an account that has migrated');
+
+        if ($status && isset($status['account'], $status['account']['acct']) && strpos($status['account']['acct'], '@') != -1) {
+            $domain = parse_url($status['account']['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        $spid = $status['account']['id'];
+
+        AccountService::setLastActive($user->id);
+
+        if (intval($spid) !== intval($user->profile_id)) {
+            if ($status['visibility'] == 'private') {
+                abort_if(! FollowerService::follows($user->profile_id, $spid), 403);
+            } else {
+                abort_if(! in_array($status['visibility'], ['public', 'unlisted']), 403);
+            }
+        }
+
+        abort_if(
+            Like::whereProfileId($user->profile_id)
+                ->where('created_at', '>', now()->subDay())
+                ->count() >= Like::MAX_PER_DAY,
+            429
+        );
+
+        $blocks = UserFilterService::blocks($spid);
+        if ($blocks && in_array($user->profile_id, $blocks)) {
+            abort(422);
+        }
+
+        $like = DB::transaction(function () use ($user, $status, $spid) {
+            $statusModel = Status::lockForUpdate()->find($status['id']);
+
+            if (! $statusModel) {
+                abort(404, 'Status not found');
+            }
+
+            $like = Like::firstOrCreate(
+                [
+                    'profile_id' => $user->profile_id,
+                    'status_id' => $status['id'],
+                ],
+                [
+                    'status_profile_id' => $spid,
+                    'is_comment' => ! empty($status['in_reply_to_id']),
+                ]
+            );
+
+            if ($like->wasRecentlyCreated) {
+                $statusModel->increment('likes_count');
+
+                DB::afterCommit(function () use ($like) {
+                    LikePipeline::dispatch($like)->onQueue('feed');
+                });
+            }
+
+            return $like;
+        });
+
+        StatusService::del($status['id']);
+        $freshStatus = $napi ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
+
+        if ($freshStatus) {
+            $freshStatus['favourited'] = true;
+            $freshStatus['bookmarked'] = BookmarkService::get($user->profile_id, $status['id']);
+            $freshStatus['reblogged'] = ReblogService::get($user->profile_id, $status['id']);
+
+            return $this->json($freshStatus);
+        }
+
+        $status['favourited'] = true;
+        $status['favourites_count'] = ($status['favourites_count'] ?? 0) + ($like->wasRecentlyCreated ? 1 : 0);
+        $status['bookmarked'] = BookmarkService::get($user->profile_id, $status['id']);
+        $status['reblogged'] = ReblogService::get($user->profile_id, $status['id']);
+
+        return $this->json($status);
+    }
+
+    /**
+     * POST /api/v1/statuses/{id}/unfavourite
+     *
+     * @param  int  $id
+     */
+    public function statusUnfavouriteById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-like', $user->id), 403, 'Invalid permissions for this action');
+
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+        $status = $napi ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
+
+        abort_unless($status && isset($status['account']), 404);
+        abort_if(isset($status['moved'], $status['moved']['id']), 422, 'Cannot unlike a post from an account that has migrated');
+
+        if ($status && isset($status['account'], $status['account']['acct']) && strpos($status['account']['acct'], '@') != -1) {
+            $domain = parse_url($status['account']['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        $spid = $status['account']['id'];
+
+        AccountService::setLastActive($user->id);
+
+        if (intval($spid) !== intval($user->profile_id)) {
+            if ($status['visibility'] == 'private') {
+                abort_if(! FollowerService::follows($user->profile_id, $spid), 403);
+            } else {
+                abort_if(! in_array($status['visibility'], ['public', 'unlisted']), 403);
+            }
+        }
+
+        $didUnlike = DB::transaction(function () use ($user, $status) {
+            $like = Like::with(['actor', 'status'])
+                ->lockForUpdate()
+                ->whereProfileId($user->profile_id)
+                ->whereStatusId($status['id'])
+                ->first();
+
+            if (! $like) {
+                return false;
+            }
+
+            DB::afterCommit(function () use ($like) {
+                UnlikePipeline::dispatch($like)->onQueue('feed');
+            });
+
+            return true;
+        });
+
+        StatusService::del($status['id']);
+        $freshStatus = $napi ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
+
+        if ($freshStatus) {
+            $freshStatus['favourited'] = false;
+            $freshStatus['bookmarked'] = BookmarkService::get($user->profile_id, $status['id']);
+            $freshStatus['reblogged'] = ReblogService::get($user->profile_id, $status['id']);
+
+            return $this->json($freshStatus);
+        }
+
+        $status['favourited'] = false;
+        $status['favourites_count'] = max(0, ($status['favourites_count'] ?? 0) - ($didUnlike ? 1 : 0));
+        $status['bookmarked'] = BookmarkService::get($user->profile_id, $status['id']);
+        $status['reblogged'] = ReblogService::get($user->profile_id, $status['id']);
+
+        return $this->json($status);
+    }
+
+    /**
+     * GET /api/v1/filters
+     *
+     *  Return empty response since we filter server side
+     */
+    public function accountFilters(Request $request): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return response()->json([]);
+    }
+
+    /**
+     * GET /api/v1/follow_requests
+     *
+     *  Return array of Accounts that have sent follow requests
+     */
+    public function accountFollowRequests(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1|max:100',
+        ]);
+
+        $user = $request->user();
+
+        $res = FollowRequest::whereFollowingId($user->profile_id)
+            ->limit($request->input('limit', 40))
+            ->pluck('follower_id')
+            ->map(function ($id) {
+                return AccountService::getMastodon($id, true);
+            })
+            ->filter(function ($acct) {
+                return $acct && isset($acct['id']);
+            })
+            ->values();
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/follow_requests/{id}/authorize
+     *
+     * @param  int  $id
+     */
+    public function accountFollowRequestAccept(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('follow'), 403);
+
+        $pid = $request->user()->profile_id;
+        $target = AccountService::getMastodon($id);
+
+        abort_if(isset($target['moved'], $target['moved']['id']), 422, 'Cannot accept a request from an account that has migrated!');
+
+        if (! $target) {
+            return response()->json(['error' => 'Record not found'], 404);
+        }
+
+        if ($target && strpos($target['acct'], '@') != -1) {
+            $domain = parse_url($target['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        $followRequest = FollowRequest::whereFollowingId($pid)->whereFollowerId($id)->first();
+
+        if (! $followRequest) {
+            return response()->json(['error' => 'Record not found'], 404);
+        }
+
+        $follower = $followRequest->follower;
+        $follow = new Follower;
+        $follow->profile_id = $follower->id;
+        $follow->following_id = $pid;
+        $follow->save();
+
+        $profile = Profile::findOrFail($pid);
+        $profile->followers_count++;
+        $profile->save();
+        AccountService::del($profile->id);
+
+        $profile = Profile::findOrFail($follower->id);
+        $profile->following_count++;
+        $profile->save();
+        AccountService::del($profile->id);
+
+        if ($follower->domain != null && $follower->private_key === null) {
+            FollowAcceptPipeline::dispatch($followRequest)->onQueue('follow');
+        } else {
+            FollowPipeline::dispatch($follow);
+            $followRequest->delete();
+        }
+
+        RelationshipService::refresh($pid, $id);
+        $res = RelationshipService::get($pid, $id);
+        $res['followed_by'] = true;
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/follow_requests/{id}/reject
+     *
+     * @param  int  $id
+     */
+    public function accountFollowRequestReject(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('follow'), 403);
+
+        $pid = $request->user()->profile_id;
+        $target = AccountService::getMastodon($id);
+
+        if (! $target) {
+            return response()->json(['error' => 'Record not found'], 404);
+        }
+
+        abort_if(isset($target['moved'], $target['moved']['id']), 422, 'Cannot reject a request from an account that has migrated!');
+
+        $followRequest = FollowRequest::whereFollowingId($pid)->whereFollowerId($id)->first();
+
+        if (! $followRequest) {
+            return response()->json(['error' => 'Record not found'], 404);
+        }
+
+        $follower = $followRequest->follower;
+
+        if ($follower->domain != null && $follower->private_key === null) {
+            FollowRejectPipeline::dispatch($followRequest)->onQueue('follow');
+        } else {
+            $followRequest->delete();
+        }
+
+        RelationshipService::refresh($pid, $id);
+        $res = RelationshipService::get($pid, $id);
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/suggestions
+     *
+     *   Return empty array as we don't support suggestions
+     */
+    public function accountSuggestions(Request $request): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        // todo
+
+        return response()->json([]);
+    }
+
+    /**
+     * GET /api/v1/instance
+     *
+     *   Information about the server.
+     */
+    public function instance(Request $request)
+    {
+        $res = Cache::remember('api:v1:instance-data-response-v1', 1800, function () {
+            $contact = Cache::remember('api:v1:instance-data:contact', 604800, function () {
+                if (config_cache('instance.admin.pid')) {
+                    return AccountService::getMastodon(config_cache('instance.admin.pid'), true);
+                }
+                $admin = User::whereIsAdmin(true)->first();
+
+                return $admin && isset($admin->profile_id) ?
+                    AccountService::getMastodon($admin->profile_id, true) :
+                    null;
+            });
+
+            $stats = Cache::remember('api:v1:instance-data:stats:v0', 43200, function () {
+                return [
+                    'user_count' => (int) User::count(),
+                    'status_count' => (int) StatusService::totalLocalStatuses(),
+                    'domain_count' => (int) Instance::count(),
+                ];
+            });
+
+            $rules = Cache::remember('api:v1:instance-data:rules', 604800, function () {
+                return config_cache('app.rules') ?
+                    collect(json_decode(config_cache('app.rules'), true))
+                        ->map(function ($rule, $key) {
+                            $id = $key + 1;
+
+                            return [
+                                'id' => "{$id}",
+                                'text' => $rule,
+                            ];
+                        })
+                        ->toArray() : [];
+            });
+
+            return [
+                'uri' => config('pixelfed.domain.app'),
+                'title' => config_cache('app.name'),
+                'short_description' => config_cache('app.short_description'),
+                'description' => config_cache('app.description'),
+                'email' => config('instance.email'),
+                'version' => '3.5.3 (compatible; Pixelfed '.config('pixelfed.version').')',
+                'urls' => [
+                    'streaming_api' => null,
+                ],
+                'stats' => $stats,
+                'thumbnail' => config_cache('app.banner_image') ?? url(Storage::url('public/headers/default.jpg')),
+                'languages' => [config('app.locale')],
+                'registrations' => (bool) config_cache('pixelfed.open_registration'),
+                'approval_required' => (bool) config_cache('instance.curated_registration.enabled'),
+                'contact_account' => $contact,
+                'rules' => $rules,
+                'mobile_registration' => (bool) config_cache('pixelfed.open_registration') && config('auth.in_app_registration'),
+                'configuration' => [
+                    'media_attachments' => [
+                        'image_matrix_limit' => 2073600,
+                        'image_size_limit' => config_cache('pixelfed.max_photo_size') * 1024,
+                        'supported_mime_types' => explode(',', config_cache('pixelfed.media_types')),
+                        'video_frame_rate_limit' => 120,
+                        'video_matrix_limit' => 2073600,
+                        'video_size_limit' => config_cache('pixelfed.max_photo_size') * 1024,
+                    ],
+                    'polls' => [
+                        'max_characters_per_option' => 50,
+                        'max_expiration' => 2629746,
+                        'max_options' => 4,
+                        'min_expiration' => 300,
+                    ],
+                    'statuses' => [
+                        'characters_reserved_per_url' => 23,
+                        'max_characters' => (int) config_cache('pixelfed.max_caption_length'),
+                        'max_media_attachments' => (int) config_cache('pixelfed.max_album_length'),
+                    ],
+                ],
+            ];
+        });
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/lists
+     *
+     *   Return empty array as we don't support lists
+     */
+    public function accountLists(Request $request): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return response()->json([]);
+    }
+
+    /**
+     * GET /api/v1/accounts/{id}/lists
+     *
+     * @param  int  $id
+     */
+    public function accountListsById(Request $request, $id): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return response()->json([]);
+    }
+
+    /**
+     * POST /api/v1/media
+     */
+    public function mediaUpload(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $this->validate($request, [
+            'file.*' => [
+                'required_without:file',
+                'mimetypes:'.config_cache('pixelfed.media_types'),
+                'max:'.config_cache('pixelfed.max_photo_size'),
+            ],
+            'file' => [
+                'required_without:file.*',
+                'mimetypes:'.config_cache('pixelfed.media_types'),
+                'max:'.config_cache('pixelfed.max_photo_size'),
+            ],
+            'filter_name' => 'nullable|string|max:24',
+            'filter_class' => 'nullable|alpha_dash|max:24',
+            'description' => 'nullable|string|max:'.config_cache('pixelfed.max_altext_length'),
+        ]);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-post', $user->id), 403, 'Invalid permissions for this action');
+
+        AccountService::setLastActive($user->id);
+
+        if ($user->last_active_at == null) {
+            return [];
+        }
+
+        if (empty($request->file('file'))) {
+            return response('', 422);
+        }
+
+        $limitKey = 'compose:rate-limit:media-upload:'.$user->id;
+        $limitTtl = now()->addMinutes(15);
+        $limitReached = Cache::remember($limitKey, $limitTtl, function () use ($user) {
+            $dailyLimit = Media::whereUserId($user->id)->where('created_at', '>', now()->subDays(1))->count();
+
+            return $dailyLimit >= 1250;
+        });
+        abort_if($limitReached == true, 429);
+
+        $profile = $user->profile;
+
+        $accountSize = UserStorageService::get($user->id);
+        abort_if($accountSize === -1, 403, 'Invalid request.');
+        $photo = $request->file('file');
+        $fileSize = $photo->getSize();
+        $sizeInKbs = (int) ceil($fileSize / 1000);
+        $updatedAccountSize = (int) $accountSize + (int) $sizeInKbs;
+
+        if ((bool) config_cache('pixelfed.enforce_account_limit') === true) {
+            $limit = (int) config_cache('pixelfed.max_account_size');
+            if ($updatedAccountSize >= $limit) {
+                abort(403, 'Account size limit reached.');
+            }
+        }
+
+        $filterClass = in_array($request->input('filter_class'), Filter::classes()) ? $request->input('filter_class') : null;
+        $filterName = in_array($request->input('filter_name'), Filter::names()) ? $request->input('filter_name') : null;
+
+        $mimes = explode(',', config_cache('pixelfed.media_types'));
+        if (in_array($photo->getMimeType(), $mimes) === false) {
+            abort(403, 'Invalid or unsupported mime type.');
+        }
+
+        $hash = \hash_file('sha256', $photo->getRealPath());
+        abort_if(MediaBlocklistService::exists($hash) == true, 451);
+
+        $storagePath = MediaPathService::get($user, 2);
+        $path = $photo->storePublicly($storagePath);
+        $license = null;
+        $mime = $photo->getMimeType();
+
+        // if($photo->getMimeType() == 'image/heic') {
+        //  abort_if(config('image.driver') !== 'imagick', 422, 'Invalid media type');
+        //  abort_if(!in_array('HEIC', \Imagick::queryformats()), 422, 'Unsupported media type');
+        //  $oldPath = $path;
+        //  $path = str_replace('.heic', '.jpg', $path);
+        //  $mime = 'image/jpeg';
+        //  \Image::make($photo)->save(storage_path("app/{$path}"));
+        //  @unlink(storage_path("app/{$oldPath}"));
+        // }
+
+        $settings = UserSetting::whereUserId($user->id)->first();
+
+        if ($settings && ! empty($settings->compose_settings)) {
+            $compose = $settings->compose_settings;
+
+            if (isset($compose['default_license']) && $compose['default_license'] != 1) {
+                $license = $compose['default_license'];
+            }
+        }
+
+        $media = new Media;
+        $media->status_id = null;
+        $media->profile_id = $profile->id;
+        $media->user_id = $user->id;
+        $media->media_path = $path;
+        $media->original_sha256 = $hash;
+        $media->size = $photo->getSize();
+        $media->mime = $mime;
+        $media->caption = $request->input('description') ?? '';
+        $media->filter_class = $filterClass;
+        $media->filter_name = $filterName;
+        if ($license) {
+            $media->license = $license;
+        }
+        $media->save();
+
+        switch ($media->mime) {
+            case 'image/jpg':
+            case 'image/jpeg':
+            case 'image/png':
+            case 'image/webp':
+            case 'image/heic':
+            case 'image/avif':
+                ImageOptimize::dispatch($media)->onQueue('mmo');
+                break;
+
+            case 'video/mp4':
+                VideoThumbnail::dispatch($media)->onQueue('mmo');
+                $preview_url = '/storage/no-preview.png';
+                $url = '/storage/no-preview.png';
+                break;
+        }
+
+        UserStorageService::increaseStorageUsed($user->id, $fileSize);
+
+        Cache::forget($limitKey);
+        $resource = new Fractal\Resource\Item($media, new MediaTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+        $res['preview_url'] = $media->url().'?v='.time();
+        $res['url'] = $media->url().'?v='.time();
+
+        return $this->json($res);
+    }
+
+    /**
+     * PUT /api/v1/media/{id}
+     *
+     * @param  int  $id
+     */
+    public function mediaUpdate(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $this->validate($request, [
+            'description' => 'nullable|string|max:'.config_cache('pixelfed.max_altext_length'),
+        ]);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-post', $user->id), 403, 'Invalid permissions for this action');
+
+        AccountService::setLastActive($user->id);
+
+        $media = Media::whereUserId($user->id)
+            ->whereProfileId($user->profile_id)
+            ->findOrFail($id);
+
+        $executed = RateLimiter::attempt(
+            'media:update:'.$user->id,
+            10,
+            function () use ($media, $request) {
+                $caption = app(SanitizeService::class)->html($request->input('description'));
+
+                if ($caption != $media->caption) {
+                    $media->caption = $caption;
+                    $media->save();
+
+                    if ($media->status_id) {
+                        MediaService::del($media->status_id);
+                        StatusService::del($media->status_id);
+                    }
+                }
+            }
+        );
+
+        if (! $executed) {
+            return response()->json([
+                'error' => 'Too many attempts. Try again in a few minutes.',
+            ], 429);
+        }
+
+        $fractal = new Fractal\Manager;
+        $fractal->setSerializer(new ArraySerializer);
+        $resource = new Fractal\Resource\Item($media, new MediaTransformer);
+
+        return $this->json($fractal->createData($resource)->toArray());
+    }
+
+    /**
+     * GET /api/v1/media/{id}
+     *
+     * @param  int  $id
+     */
+    public function mediaGet(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-post', $user->id), 403, 'Invalid permissions for this action');
+        AccountService::setLastActive($user->id);
+
+        $media = Media::whereUserId($user->id)
+            ->whereNull('status_id')
+            ->findOrFail($id);
+
+        $resource = new Fractal\Resource\Item($media, new MediaTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+
+        $processing = (bool) config_cache('pixelfed.cloud_storage')
+            && ! config('pixelfed.media_fast_process')
+            && in_array($media->mime, [
+                'image/jpg',
+                'image/jpeg',
+                'image/png',
+                'image/webp',
+                'image/heic',
+                'image/avif',
+                'video/mp4',
+            ])
+            && ! $media->cdn_url;
+
+        return $this->json($res, $processing ? 206 : 200);
+    }
+
+    /**
+     * POST /api/v2/media
+     */
+    public function mediaUploadV2(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $this->validate($request, [
+            'file.*' => [
+                'required_without:file',
+                'mimetypes:'.config_cache('pixelfed.media_types'),
+                'max:'.config_cache('pixelfed.max_photo_size'),
+            ],
+            'file' => [
+                'required_without:file.*',
+                'mimetypes:'.config_cache('pixelfed.media_types'),
+                'max:'.config_cache('pixelfed.max_photo_size'),
+            ],
+            'filter_name' => 'nullable|string|max:24',
+            'filter_class' => 'nullable|alpha_dash|max:24',
+            'description' => 'nullable|string|max:'.config_cache('pixelfed.max_altext_length'),
+            'replace_id' => 'sometimes',
+        ]);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-post', $user->id), 403, 'Invalid permissions for this action');
+
+        if ($user->last_active_at == null) {
+            return [];
+        }
+
+        AccountService::setLastActive($user->id);
+
+        if (empty($request->file('file'))) {
+            return response('', 422);
+        }
+
+        $limitKey = 'compose:rate-limit:media-upload:'.$user->id;
+        $limitTtl = now()->addMinutes(15);
+        $limitReached = Cache::remember($limitKey, $limitTtl, function () use ($user) {
+            $dailyLimit = Media::whereUserId($user->id)->where('created_at', '>', now()->subDays(1))->count();
+
+            return $dailyLimit >= 1250;
+        });
+        abort_if($limitReached == true, 429);
+
+        $profile = $user->profile;
+
+        $accountSize = UserStorageService::get($user->id);
+        abort_if($accountSize === -1, 403, 'Invalid request.');
+        $photo = $request->file('file');
+        $fileSize = $photo->getSize();
+        $sizeInKbs = (int) ceil($fileSize / 1000);
+        $updatedAccountSize = (int) $accountSize + (int) $sizeInKbs;
+
+        if ((bool) config_cache('pixelfed.enforce_account_limit') === true) {
+            $limit = (int) config_cache('pixelfed.max_account_size');
+            if ($updatedAccountSize >= $limit) {
+                abort(403, 'Account size limit reached.');
+            }
+        }
+
+        $filterClass = in_array($request->input('filter_class'), Filter::classes()) ? $request->input('filter_class') : null;
+        $filterName = in_array($request->input('filter_name'), Filter::names()) ? $request->input('filter_name') : null;
+
+        $mimes = explode(',', config_cache('pixelfed.media_types'));
+        if (in_array($photo->getMimeType(), $mimes) === false) {
+            abort(403, 'Invalid or unsupported mime type.');
+        }
+
+        $hash = \hash_file('sha256', $photo->getRealPath());
+        abort_if(MediaBlocklistService::exists($hash) == true, 451);
+
+        $storagePath = MediaPathService::get($user, 2);
+        $path = $photo->storePublicly($storagePath);
+        $license = null;
+        $mime = $photo->getMimeType();
+
+        $settings = UserSetting::whereUserId($user->id)->first();
+
+        if ($settings && ! empty($settings->compose_settings)) {
+            $compose = $settings->compose_settings;
+
+            if (isset($compose['default_license']) && $compose['default_license'] != 1) {
+                $license = $compose['default_license'];
+            }
+        }
+
+        if ($request->has('replace_id')) {
+            $rpid = $request->input('replace_id');
+            $removeMedia = Media::whereNull('status_id')
+                ->whereUserId($user->id)
+                ->whereProfileId($profile->id)
+                ->where('created_at', '>', now()->subHours(2))
+                ->find($rpid);
+            if ($removeMedia) {
+                $dateTime = now();
+                MediaDeletePipeline::dispatch($removeMedia)
+                    ->onQueue('mmo')
+                    ->delay($dateTime->addMinutes(15));
+            }
+        }
+
+        $media = new Media;
+        $media->status_id = null;
+        $media->profile_id = $profile->id;
+        $media->user_id = $user->id;
+        $media->media_path = $path;
+        $media->original_sha256 = $hash;
+        $media->size = $photo->getSize();
+        $media->mime = $mime;
+        $media->caption = $request->input('description') ?? '';
+        $media->filter_class = $filterClass;
+        $media->filter_name = $filterName;
+        if ($license) {
+            $media->license = $license;
+        }
+        $media->save();
+
+        switch ($media->mime) {
+            case 'image/jpg':
+            case 'image/jpeg':
+            case 'image/png':
+            case 'image/webp':
+            case 'image/heic':
+            case 'image/avif':
+                ImageOptimize::dispatch($media)->onQueue('mmo');
+                break;
+
+            case 'video/mp4':
+                VideoThumbnail::dispatch($media)->onQueue('mmo');
+                $preview_url = '/storage/no-preview.png';
+                $url = '/storage/no-preview.png';
+                break;
+        }
+
+        UserStorageService::increaseStorageUsed($user->id, $fileSize);
+
+        Cache::forget($limitKey);
+        $resource = new Fractal\Resource\Item($media, new MediaTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+        $res['preview_url'] = $media->url().'?v='.time();
+        $res['url'] = null;
+
+        return $this->json($res, 202);
+    }
+
+    /**
+     * GET /api/v1/mutes
+     */
+    public function accountMutes(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+        ]);
+
+        $user = $request->user();
+        $limit = $request->input('limit', 40);
+        if ($limit > 80) {
+            $limit = 80;
+        }
+
+        $mutes = UserFilter::whereUserId($user->profile_id)
+            ->whereIn('filterable_type', ['App\Profile', Profile::class])
+            ->whereFilterType('mute')
+            ->orderByDesc('id')
+            ->simplePaginate($limit)
+            ->withQueryString();
+
+        $res = $mutes->pluck('filterable_id')
+            ->map(function ($id) {
+                return AccountService::get($id, true);
+            })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values();
+
+        $baseUrl = config('app.url').'/api/v1/mutes?limit='.$limit.'&';
+        $next = $mutes->nextPageUrl();
+        $prev = $mutes->previousPageUrl();
+
+        if ($next && ! $prev) {
+            $link = '<'.$next.'>; rel="next"';
+        }
+
+        if (! $next && $prev) {
+            $link = '<'.$prev.'>; rel="prev"';
+        }
+
+        if ($next && $prev) {
+            $link = '<'.$next.'>; rel="next",<'.$prev.'>; rel="prev"';
+        }
+        $headers = isset($link) ? ['Link' => $link] : [];
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * POST /api/v1/accounts/{id}/mute
+     *
+     * @param  int  $id
+     */
+    public function accountMuteById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        $pid = $user->profile_id;
+
+        if (intval($pid) === intval($id)) {
+            return $this->json(['error' => 'You cannot mute yourself'], 500);
+        }
+
+        $account = Profile::findOrFail($id);
+
+        abort_if($account->moved_to_profile_id, 422, 'Cannot mute an account that has migrated!');
+
+        if ($account && $account->domain) {
+            $domain = $account->domain;
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        $count = UserFilterService::muteCount($pid);
+        $maxLimit = (int) config_cache('instance.user_filters.max_user_mutes');
+        if ($count === 0) {
+            $filterCount = UserFilter::whereUserId($pid)
+                ->whereFilterType('mute')
+                ->get()
+                ->map(function ($rec) {
+                    return AccountService::get($rec->filterable_id, true);
+                })
+                ->filter(function ($account) {
+                    return $account && isset($account['id']);
+                })
+                ->values()
+                ->count();
+            abort_if($filterCount >= $maxLimit, 422, AccountController::FILTER_LIMIT_MUTE_TEXT.$maxLimit.' accounts');
+        } else {
+            abort_if($count >= $maxLimit, 422, AccountController::FILTER_LIMIT_MUTE_TEXT.$maxLimit.' accounts');
+        }
+
+        $filter = UserFilter::firstOrCreate([
+            'user_id' => $pid,
+            'filterable_id' => $account->id,
+            'filterable_type' => Profile::class,
+            'filter_type' => 'mute',
+        ]);
+
+        RelationshipService::refresh($pid, $id);
+
+        $resource = new Fractal\Resource\Item($account, new RelationshipTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/accounts/{id}/unmute
+     *
+     * @param  int  $id
+     */
+    public function accountUnmuteById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        $pid = $user->profile_id;
+
+        if (intval($pid) === intval($id)) {
+            return $this->json(['error' => 'You cannot unmute yourself'], 500);
+        }
+
+        $profile = Profile::findOrFail($id);
+
+        abort_if($profile->moved_to_profile_id, 422, 'Cannot unmute an account that has migrated!');
+
+        $filter = UserFilter::whereUserId($pid)
+            ->whereFilterableId($profile->id)
+            ->whereIn('filterable_type', ['App\Profile', Profile::class])
+            ->whereFilterType('mute')
+            ->first();
+
+        if ($filter) {
+            $filter->delete();
+            UserFilterService::unmute($pid, $profile->id);
+        }
+
+        RelationshipService::refresh($pid, $id);
+
+        $resource = new Fractal\Resource\Item($profile, new RelationshipTransformer);
+        $res = $this->fractal->createData($resource)->toArray();
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/notifications
+     */
+    public function accountNotifications(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+            'min_id' => 'nullable|integer|min:1|max:'.PHP_INT_MAX,
+            'max_id' => 'nullable|integer|min:1|max:'.PHP_INT_MAX,
+            'since_id' => 'nullable|integer|min:1|max:'.PHP_INT_MAX,
+            'types[]' => 'sometimes|array',
+            'types[].*' => 'string|in:mention,reblog,follow,favourite',
+            'type' => 'sometimes|string|in:mention,reblog,follow,favourite',
+            '_pe' => 'sometimes',
+        ]);
+
+        $pid = $request->user()->profile_id;
+        $limit = min((int) $request->input('limit', 20), 40);
+
+        $since = $request->input('since_id');
+        $min = $request->input('min_id');
+        $max = $request->input('max_id');
+
+        if (! $since && ! $min && ! $max) {
+            $min = 1;
+        }
+
+        if ($since) {
+            $min = $since + 1;
+        }
+
+        $types = $request->input('types');
+        if (is_string($types)) {
+            $types = [$types];
+        }
+        $types = $types ? array_values(array_filter($types)) : null;
+
+        AccountService::setLastActive($request->user()->id);
+
+        $page = $max
+            ? NotificationService::getMaxMastodonPage($pid, $max, $limit, $types)
+            : NotificationService::getMinMastodonPage($pid, $min ?? $since, $limit, $types);
+
+        if (empty($page['data']) && ! Cache::has('pf:services:notifications:hasSynced:'.$pid)) {
+            Cache::put('pf:services:notifications:hasSynced:'.$pid, 1, 1209600);
+            NotificationWarmUserCache::dispatch($pid);
+        }
+
+        $res = collect($page['data'])
+            ->map(function ($n) use ($pid) {
+                if (isset($n['status']['id'])) {
+                    $n['status']['favourited'] = (bool) LikeService::liked($pid, $n['status']['id']);
+                    $n['status']['reblogged'] = (bool) ReblogService::get($pid, $n['status']['id']);
+                    $n['status']['bookmarked'] = (bool) BookmarkService::get($pid, $n['status']['id']);
+                }
+
+                return $n;
+            })
+            ->values();
+
+        $baseUrl = config('app.url').'/api/v1/notifications?limit='.$limit.'&';
+        if ($types) {
+            $baseUrl .= 'types[]='.implode('&types[]=', $types).'&';
+        }
+
+        $links = [];
+        if ($page['next_max_id']) {
+            $links[] = '<'.$baseUrl.'max_id='.$page['next_max_id'].'>; rel="next"';
+        }
+        if ($page['prev_min_id']) {
+            $links[] = '<'.$baseUrl.'min_id='.$page['prev_min_id'].'>; rel="prev"';
+        }
+
+        $headers = $links ? ['Link' => implode(',', $links)] : [];
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * Resolve the home timeline cursor to a pair of optional positive ids.
+     *
+     * A cursor that is sent but holds nothing usable — min_id=0, min_id=, a
+     * value the client meant as "from the start" — used to pick the getter by
+     * parameter presence alone, so min_id=0&max_id=<newest> paged against a
+     * zero floor and came back empty on every request. min_id still wins when
+     * both are sent positive, which is what clients already rely on.
+     */
+    protected function normaliseHomeCursor(Request $request): array
+    {
+        $resolve = function ($value) {
+            if ($value === null || $value === '' || ! is_numeric($value)) {
+                return null;
+            }
+
+            return (int) $value > 0 ? (int) $value : null;
+        };
+
+        return [
+            'min' => $resolve($request->input('min_id')),
+            'max' => $resolve($request->input('max_id')),
+        ];
+    }
+
+    /**
+     * Rebuild a home feed that has no cached set and serve the window the
+     * request asked for out of it.
+     *
+     * The settled-empty guard comes first, so a feed a completed warm has
+     * already found empty costs nothing to read. The lock is non-blocking and
+     * short-lived: a request that loses it serves nothing rather than running
+     * a second full warm, which is the concurrency protection the old
+     * check-then-set marker could not give. A warm that throws releases the
+     * lock and writes no record of emptiness, so the next request retries.
+     */
+    protected function homeColdBoot($pid, array $cursor, int $paddedLimit): array
+    {
+        if (! HomeTimelineService::shouldWarmEmpty($pid)) {
+            return [];
+        }
+
+        $lock = Cache::lock('pf:timeline:home:warm:lock:'.$pid, 30);
+
+        if (! $lock->get()) {
+            return [];
+        }
+
+        try {
+            $added = HomeTimelineService::warmCache($pid, true, self::HOME_COLD_BOOT_DEPTH);
+        } catch (\Throwable $e) {
+            Log::warning('timelineHome: home feed warm failed', [
+                'pid' => $pid,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [];
+        } finally {
+            $lock->release();
+        }
+
+        if ($added === 0) {
+            return [];
+        }
+
+        if ($added >= self::HOME_COLD_BOOT_DEPTH) {
+            // The warm filled the depth a request should wait for, so there
+            // is more to collect than this response needs. A shallower result
+            // means the candidate set was exhausted and a deeper pass over
+            // the same query cannot find more.
+            FeedWarmCachePipeline::dispatch($pid)->onQueue('feed');
+        }
+
+        return $this->fetchHomeWindow($pid, $cursor, $paddedLimit);
+    }
+
+    /**
+     * The next window to try when the current one rendered nothing.
+     *
+     * A min_id request deepens the same bounded window rather than walking
+     * older: Redis enforces the min_id floor inside the query, so a member at
+     * or below the cursor can never be returned, whereas paging older would
+     * serve the client posts it has already displayed. Anything else walks
+     * older from the last member seen.
+     */
+    protected function continueHomeWindow($pid, array $cursor, array $prevIds, int $pass, int $paddedLimit): array
+    {
+        if ($cursor['min']) {
+            $all = HomeTimelineService::getRankedMinId($pid, $cursor['min'], $paddedLimit * ($pass + 1));
+
+            return array_slice($all, $paddedLimit * $pass);
+        }
+
+        return HomeTimelineService::getRankedMaxId($pid, end($prevIds), $paddedLimit);
+    }
+
+    protected function fetchHomeWindow($pid, array $cursor, int $paddedLimit): array
+    {
+        if ($cursor['min']) {
+            return HomeTimelineService::getRankedMinId($pid, $cursor['min'], $paddedLimit);
+        }
+
+        if ($cursor['max']) {
+            return HomeTimelineService::getRankedMaxIdOrRecent($pid, $cursor['max'], $paddedLimit);
+        }
+
+        return HomeTimelineService::get($pid, 0, $paddedLimit);
+    }
+
+    /**
+     * GET /api/v1/timelines/home
+     */
+    public function timelineHome(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'page' => 'sometimes|integer|max:40',
+            'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'limit' => 'sometimes|integer|min:1',
+            'include_reblogs' => 'sometimes',
+        ]);
+
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+        $limit = min((int) ($request->input('limit') ?? 20), 40);
+        $pid = $request->user()->profile_id;
+        $other = $request->user()->settings->other ?? [];
+
+        $includeReblogs = $request->filled('include_reblogs')
+            ? $request->boolean('include_reblogs')
+            : (bool) data_get($other, 'enable_reblogs', false);
+
+        // "Photo reblogs only"
+        $photosReblogsOnly = $request->filled('photos_reblogs_only')
+            ? $request->boolean('photos_reblogs_only')
+            : (bool) data_get($other, 'photo_reblogs_only', false);
+
+        // Mirrors the StatusService lift condition: these clients render a boost
+        // from the top level, so the original author has to be lifted with the content
+        $liftReblogAuthor = $napi && $includeReblogs && ! $request->filled('include_reblogs');
+
+        $postTypes = ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'];
+        $inTypes = $includeReblogs ? [...$postTypes, 'share'] : $postTypes;
+
+        AccountService::setLastActive($request->user()->id);
+
+        $homeFilters = array_filter(
+            CustomFilter::getCachedFiltersForAccount($pid),
+            function ($item) {
+                [$filter, $rules] = $item;
+
+                return in_array('home', $filter->context);
+            }
+        );
+
+        $mutedAndBlocked = UserFilterService::filters($pid);
+        $domainBlocks = UserFilterService::domainBlocks($pid);
+
+        $paddedLimit = $includeReblogs ? $limit + 10 : $limit + 50;
+
+        $cursor = $this->normaliseHomeCursor($request);
+
+        $ids = $this->fetchHomeWindow($pid, $cursor, $paddedLimit);
+
+        // No cached set at all. This fires for a cursor-ful request too: a
+        // client holding a cursor from a feed that has since gone used to get
+        // an empty page on every retry, because the rebuild only ran for a
+        // request that sent no cursor.
+        if (! HomeTimelineService::cacheKeyExists($pid)) {
+            $ids = $this->homeColdBoot($pid, $cursor, $paddedLimit);
+        }
+
+        // Why a member was dropped decides what the response can do about it.
+        $drops = ['unrenderable' => 0, 'reblog' => 0, 'viewer' => 0, 'hide' => 0];
+        $pruned = 0;
+
+        $hydrate = function (array $ids) use (
+            $napi,
+            $pid,
+            $mutedAndBlocked,
+            $domainBlocks,
+            $homeFilters,
+            $includeReblogs,
+            $photosReblogsOnly,
+            $postTypes,
+            $limit,
+            $liftReblogAuthor,
+            &$drops,
+            &$pruned
+        ) {
+            return collect($ids)
+                ->map(function ($id) use ($napi, $pid, &$drops, &$pruned) {
+                    try {
+                        $status = StatusService::get($id, false);
+                    } catch (\Exception) {
+                        $status = null;
+                    }
+
+                    // A share whose boosted status has gone renders as nothing
+                    // at all, same as a member with no account behind it.
+                    $brokenShare = ($status['pf_type'] ?? null) === 'share' && empty($status['reblog']);
+
+                    if (! isset($status['account']['id']) || $brokenShare) {
+                        // The member points at something that cannot be
+                        // rendered any more. Leaving it in place is how a feed
+                        // goes on reporting plenty of members while serving an
+                        // empty page on every request.
+                        $drops['unrenderable']++;
+                        $pruned++;
+                        HomeTimelineService::rem($pid, $id);
+
+                        return null;
+                    }
+
+                    if (! $napi) {
+                        try {
+                            $status = StatusService::getMastodon($id, false);
+                        } catch (\Exception) {
+                            $status = null;
+                        }
+
+                        if (! isset($status['account']['id'])) {
+                            $drops['unrenderable']++;
+                            $pruned++;
+                            HomeTimelineService::rem($pid, $id);
+
+                            return null;
+                        }
+                    }
+
+                    return $status;
+                })
+                ->filter()
+                ->filter(function ($status) use ($mutedAndBlocked, $domainBlocks, &$drops) {
+                    $accountIds = [(int) $status['account']['id']];
+                    if (! empty($status['reblog']['account']['id'])) {
+                        $accountIds[] = (int) $status['reblog']['account']['id'];
+                    }
+
+                    foreach ($accountIds as $accountId) {
+                        if (in_array($accountId, $mutedAndBlocked)) {
+                            $drops['viewer']++;
+
+                            return false;
+                        }
+                    }
+
+                    if ($domainBlocks && count($domainBlocks)) {
+                        foreach ([$status['url'] ?? null, $status['reblog']['url'] ?? null] as $url) {
+                            if (! $url) {
+                                continue;
+                            }
+                            $domain = strtolower((string) parse_url($url, PHP_URL_HOST));
+                            if (in_array($domain, $domainBlocks)) {
+                                $drops['viewer']++;
+
+                                return false;
+                            }
+                        }
+                    }
+
+                    return true;
+                })
+                ->filter(function ($status) use ($includeReblogs, $photosReblogsOnly, $postTypes, &$drops) {
+                    if (empty($status['reblog'])) {
+                        return true;
+                    }
+
+                    if (! $includeReblogs) {
+                        $drops['reblog']++;
+
+                        return false;
+                    }
+
+                    // a boost must share a photo or video
+                    if (! $photosReblogsOnly || in_array(data_get($status['reblog'], 'pf_type'), $postTypes)) {
+                        return true;
+                    }
+
+                    $drops['reblog']++;
+
+                    return false;
+                })
+                ->map(function ($status) use ($homeFilters, &$drops) {
+                    $filterResults = CustomFilter::applyCachedFilters($homeFilters, $status);
+
+                    if (! empty($filterResults)) {
+                        $status['filtered'] = $filterResults;
+                        $shouldHide = collect($filterResults)->contains(function ($result) {
+                            return $result['filter']['filter_action'] === 'hide';
+                        });
+
+                        if ($shouldHide) {
+                            $drops['hide']++;
+
+                            return null;
+                        }
+                    }
+
+                    return $status;
+                })
+                ->filter()
+                ->take($limit)
+                ->map(function ($status) use ($pid) {
+                    $status['favourited'] = (bool) LikeService::liked($pid, $status['id']);
+                    $status['reblogged'] = (bool) ReblogService::get($pid, $status['id']);
+                    $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
+
+                    if (! empty($status['reblog'])) {
+                        $status['reblog']['favourited'] = (bool) LikeService::liked($pid, $status['reblog']['id']);
+                        $status['reblog']['reblogged'] = (bool) ReblogService::get($pid, $status['reblog']['id']);
+                        $status['reblog']['bookmarked'] = (bool) BookmarkService::get($pid, $status['reblog']['id']);
+                    }
+
+                    return $status;
+                })
+                ->map(function ($status) use ($liftReblogAuthor) {
+                    return $liftReblogAuthor ? $this->liftReblogAuthor($status) : $status;
+                })
+                ->values();
+        };
+
+        $res = $hydrate($ids);
+
+        // Every member this request fetched, across continuation passes. The
+        // Link cursor is derived from it rather than from the last pass alone,
+        // which would point the client back inside a block it has already
+        // walked.
+        $cursorIds = $ids;
+        $pass = 0;
+
+        // A window can hold plenty of members and render none of them: boosts
+        // for a viewer who has boosts off, a muted account's run of posts, the
+        // members that were just pruned. Walking on is the difference between
+        // a short page and a timeline that reports the end of the feed. An
+        // explicit filter is not a reason to walk on: the viewer asked for it.
+        while (
+            $res->isEmpty()
+            && $pass < 3
+            && $ids
+            && ($drops['unrenderable'] || $drops['reblog'] || $drops['viewer'])
+        ) {
+            $pass++;
+            $ids = $this->continueHomeWindow($pid, $cursor, $ids, $pass, $paddedLimit);
+
+            if (! $ids) {
+                break;
+            }
+
+            $cursorIds = array_merge($cursorIds, $ids);
+            $res = $hydrate($ids);
+        }
+
+        if ($pruned) {
+            Log::info('timelineHome: pruned unrenderable home feed members', [
+                'pid' => $pid,
+                'count' => $pruned,
+            ]);
+        }
+
+        // The prune can take the last member with it, and Redis drops an empty
+        // sorted set, so the feed is now genuinely absent. Rebuilding here
+        // cannot loop: the key is gone, so the branch is unreachable a second
+        // time within the request.
+        if ($res->isEmpty() && $drops['unrenderable'] > 0 && ! HomeTimelineService::cacheKeyExists($pid)) {
+            $ids = $this->homeColdBoot($pid, $cursor, $paddedLimit);
+
+            if ($ids) {
+                $cursorIds = $ids;
+            }
+
+            $res = $hydrate($ids);
+        }
+
+        $headers = [];
+        $baseUrl = config('app.url').'/api/v1/timelines/home?limit='.$limit.'&'.($napi ? '_pe=1&' : '');
+
+        if ($res->isNotEmpty()) {
+            // The feed is ranked by created_at, so the next/prev cursors have to
+            // follow display order rather than numeric id. A remote post can
+            // carry a low id but a recent date, so picking the min/max id would
+            // point the cursor at the wrong row and re-serve posts on scroll.
+            $newest = $res->first()['id'];
+            $oldest = $res->last()['id'];
+
+            $headers['Link'] = '<'.$baseUrl.'max_id='.$oldest.'>; rel="next",<'.$baseUrl.'min_id='.$newest.'>; rel="prev"';
+        } elseif ($cursorIds) {
+            // The page is empty but the window was not, so there is a way
+            // forward. Members arrive newest-first and continuation appends
+            // older windows, so display order is array order; the numeric
+            // minimum would be the wrong member as soon as a remote post
+            // carries a low id and a recent date, and the client would skip
+            // everything between the two.
+            if ($cursor['min']) {
+                // This client asked for content newer than its cursor, so an
+                // older cursor would point it back at posts it already has.
+                $headers['Link'] = '<'.$baseUrl.'min_id='.(int) reset($cursorIds).'>; rel="prev"';
+            } else {
+                $headers['Link'] = '<'.$baseUrl.'max_id='.(int) end($cursorIds).'>; rel="next"';
+            }
+        }
+
+        // An empty fetched window emits no Link at all, which is how a client
+        // is told it has reached the end of the feed.
+
+        return $this->json($res->toArray(), 200, $headers);
+    }
+
+    /**
+     * StatusService lifts a boost's content to the top level for _pe clients
+     * that don't send include_reblogs. In the home feed those clients render
+     * the card from the top level alone, so the author, counts and viewer
+     * state must come from the shared post too. Actions on the card resolve
+     * to that post (resolveReblogTargetId), so the state has to match it.
+     * Scoped to the home timeline: profile feeds and single-status views
+     * keep the booster.
+     */
+    protected function liftReblogAuthor(array $status): array
+    {
+        if (empty($status['reblog']['account'])) {
+            return $status;
+        }
+
+        $status['reblogged_by'] = $status['account'];
+
+        foreach (
+            [
+                'account',
+                'favourites_count',
+                'reblogs_count',
+                'reply_count',
+                'liked_by',
+                'favourited',
+                'reblogged',
+                'bookmarked',
+            ] as $key
+        ) {
+            if (array_key_exists($key, $status['reblog'])) {
+                $status[$key] = $status['reblog'][$key];
+            }
+        }
+
+        return $status;
+    }
+
+    /**
+     * GET /api/v1/timelines/public
+     */
+    public function timelinePublic(Request $request)
+    {
+        $this->validate($request, [
+            'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'limit' => 'sometimes|integer|min:1',
+            'remote' => 'sometimes',
+            'local' => 'sometimes',
+        ]);
+
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+        $min = $request->input('min_id');
+        $max = $request->input('max_id');
+        if ($max !== null && (int) $max === 0) {
+            $min = 1;
+        }
+        $minOrMax = $request->anyFilled(['max_id', 'min_id']);
+        $limit = $request->input('limit') ?? 20;
+        if ($limit > 40) {
+            $limit = 40;
+        }
+        $user = $request->user();
+        $pid = $user->profile_id;
+        $remote = $request->has('remote') && $request->boolean('remote');
+        $local = $request->boolean('local');
+        $userRoleKey = $remote ? 'can-view-network-feed' : 'can-view-public-feed';
+        if ($user->has_roles && ! UserRoleService::can($userRoleKey, $user->id)) {
+            return [];
+        }
+        $filtered = $user ? UserFilterService::filters($user->profile_id) : [];
+        AccountService::setLastActive($user->id);
+        $domainBlocks = UserFilterService::domainBlocks($user->profile_id);
+        $hideNsfw = config('instance.hide_nsfw_on_public_feeds');
+        $amin = SnowflakeService::byDate(now()->subDays(config('federation.network_timeline_days_falloff')));
+        $asf = AdminShadowFilterService::getHideFromPublicFeedsList();
+
+        $cachedFilters = CustomFilter::getCachedFiltersForAccount($pid);
+
+        $homeFilters = array_filter($cachedFilters, function ($item) {
+            [$filter, $rules] = $item;
+
+            return in_array('public', $filter->context);
+        });
+
+        // Null when no warm was attempted, true when this request ran one,
+        // false when it lost the lock to a request running one right now.
+        $warmRan = null;
+
+        if ($local && $remote) {
+            $feed = Status::select(
+                'id',
+                'uri',
+                'type',
+                'scope',
+                'created_at',
+                'profile_id',
+                'in_reply_to_id',
+                'reblog_of_id'
+            )
+                ->when($minOrMax, function ($q, $minOrMax) use ($min, $max) {
+                    $dir = $min ? '>' : '<';
+                    $id = $min ?? $max;
+
+                    return $q->where('id', $dir, $id);
+                })
+                ->whereNull(['in_reply_to_id', 'reblog_of_id'])
+                ->when($hideNsfw, function ($q, $hideNsfw) {
+                    return $q->where('is_nsfw', false);
+                })
+                ->whereIn('type', ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'])
+                ->whereScope('public')
+                ->where('id', '>', $amin)
+                ->orderByDesc('id')
+                ->limit(($limit * 2))
+                ->pluck('id')
+                ->values()
+                ->toArray();
+        } elseif ($remote && ! $local) {
+            if (NetworkTimelineService::count() === 0 && NetworkTimelineService::shouldWarmEmpty()) {
+                $warmRan = Cache::lock('api:v1:timelines:network:cache_check:lock', 10)->get(function () {
+                    if (NetworkTimelineService::count() === 0 && NetworkTimelineService::shouldWarmEmpty()) {
+                        NetworkTimelineService::warmCache(true);
+                    }
+
+                    // Returning a value is what makes a lost lock (false)
+                    // distinguishable from a warm that ran.
+                    return true;
+                });
+            }
+
+            if ($max) {
+                $feed = NetworkTimelineService::getRankedMaxIdOrRecent($max, $limit + 5);
+            } elseif ($min) {
+                $feed = NetworkTimelineService::getRankedMinId($min, $limit + 5);
+            } else {
+                $feed = NetworkTimelineService::get(0, $limit + 5);
+            }
+        } else {
+            if (PublicTimelineService::count() === 0 && PublicTimelineService::shouldWarmEmpty()) {
+                $warmRan = Cache::lock('api:v1:timelines:public:cache_check:lock', 10)->get(function () {
+                    if (PublicTimelineService::count() === 0 && PublicTimelineService::shouldWarmEmpty()) {
+                        PublicTimelineService::warmCache(true, 400);
+                    }
+
+                    return true;
+                });
+            }
+
+            if ($max) {
+                $feed = PublicTimelineService::getRankedMaxIdOrRecent($max, $limit + 5);
+            } elseif ($min) {
+                $feed = PublicTimelineService::getRankedMinId($min, $limit + 5);
+            } else {
+                $feed = PublicTimelineService::get(0, $limit + 5);
+            }
+        }
+
+        $res = collect($feed)
+            ->filter(function ($k) use ($min, $max) {
+                if (! $min && ! $max) {
+                    return true;
+                }
+
+                if ($min) {
+                    return $min != $k;
+                }
+
+                if ($max) {
+                    return $max != $k;
+                }
+            })
+            ->map(function ($k) use ($user, $napi) {
+                try {
+                    $status = $napi ? StatusService::get($k) : StatusService::getMastodon($k);
+                    if (! $status || ! isset($status['account']) || ! isset($status['account']['id'])) {
+                        return false;
+                    }
+                } catch (\Exception) {
+                    return false;
+                }
+
+                $account = $napi ? AccountService::get($status['account']['id'], true) : AccountService::getMastodon($status['account']['id'], true);
+                if (! $account) {
+                    return false;
+                }
+
+                $status['account'] = $account;
+
+                if ($user) {
+                    $status['favourited'] = (bool) LikeService::liked($user->profile_id, $k);
+                    $status['reblogged'] = (bool) ReblogService::get($user->profile_id, $status['id']);
+                    $status['bookmarked'] = (bool) BookmarkService::get($user->profile_id, $status['id']);
+                }
+
+                return $status;
+            })
+            ->filter(function ($s) use ($filtered) {
+                return $s && isset($s['account']) && in_array($s['account']['id'], $filtered) === false;
+            })
+            ->filter(function ($s) use ($domainBlocks) {
+                if (! $domainBlocks || ! count($domainBlocks)) {
+                    return $s;
+                }
+                $domain = strtolower(parse_url($s['url'], PHP_URL_HOST));
+
+                return ! in_array($domain, $domainBlocks);
+            })
+            ->filter(function ($s) use ($asf, $user) {
+                if (! $asf || count($asf) === 0) {
+                    return true;
+                }
+
+                if (in_array($s['account']['id'], $asf)) {
+                    if ($user->profile_id == $s['account']['id']) {
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                return true;
+            })
+            ->map(function ($status) use ($homeFilters) {
+                $filterResults = CustomFilter::applyCachedFilters($homeFilters, $status);
+
+                if (! empty($filterResults)) {
+                    $status['filtered'] = $filterResults;
+                    $shouldHide = collect($filterResults)->contains(function ($result) {
+                        return $result['filter']['filter_action'] === 'hide';
+                    });
+
+                    if ($shouldHide) {
+                        return null;
+                    }
+                }
+
+                return $status;
+            })
+            ->filter()
+            ->take($limit)
+            ->values();
+
+        $baseUrl = $napi ? config('app.url').'/api/v1/timelines/public?limit='.$limit.'&_pe=1&' : config('app.url').'/api/v1/timelines/public?limit='.$limit.'&';
+        if ($remote) {
+            $baseUrl .= 'remote=1&';
+        }
+        if ($local) {
+            $baseUrl .= 'local=1&';
+        }
+        // The feed is ranked by created_at, so the next/prev cursors follow
+        // display order rather than numeric id. A remote post can carry a low
+        // id but a recent date, so the min/max id would point the cursor at the
+        // wrong row and re-serve posts on scroll.
+        $newest = $res->isNotEmpty() ? $res->first()['id'] : null;
+        $oldest = $res->isNotEmpty() ? $res->last()['id'] : null;
+
+        if ($newest == $oldest) {
+            $newest = null;
+        }
+
+        if ($oldest && $res->count() >= $limit) {
+            $link = '<'.$baseUrl.'max_id='.$oldest.'>; rel="next"';
+        }
+
+        if ($newest) {
+            $link = '<'.$baseUrl.'min_id='.$newest.'>; rel="prev"';
+        }
+
+        if ($oldest && $newest) {
+            $link = '<'.$baseUrl.'max_id='.$oldest.'>; rel="next",<'.$baseUrl.'min_id='.$newest.'>; rel="prev"';
+        }
+
+        $headers = isset($link) ? ['Link' => $link] : [];
+
+        return $this->json($res->toArray(), 200, $headers);
+    }
+
+    /**
+     * GET /api/v1/conversations
+     *
+     * Mastodon compatible view of direct message conversations. Group
+     * conversations are only included when `include_groups` is set, because
+     * older clients open a conversation by its first account and would show
+     * a group as a one-to-one thread.
+     */
+    public function conversations(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1|max:40',
+            'scope' => 'nullable|in:inbox,sent,requests',
+            'min_id' => 'nullable|integer',
+            'max_id' => 'nullable|integer',
+            'since_id' => 'nullable|integer',
+            'include_groups' => 'sometimes',
+        ]);
+
+        $limit = min((int) $request->input('limit', 20), 20);
+        $scope = $request->input('scope', 'inbox');
+        $user = $request->user();
+        $max_id = $request->input('max_id');
+        $since_id = $request->input('since_id') ?? $request->input('min_id');
+        $includeGroups = $request->boolean('include_groups');
+
+        $service = app(DirectMessageService::class);
+        $payloads = app(DirectMessagePayloadService::class);
+
+        if (! $service->canUseDirectMessages($user)) {
+            return [];
+        }
+
+        $pid = $user->profile_id;
+
+        $rows = DmConversationParticipant::query()
+            ->join('dm_conversations', 'dm_conversations.id', '=', 'dm_conversation_participants.conversation_id')
+            ->where('dm_conversation_participants.profile_id', $pid)
+            ->whereNotNull('dm_conversation_participants.last_activity_at')
+            ->whereNull('dm_conversation_participants.hidden_at')
+            ->whereNotNull('dm_conversations.last_message_id')
+            ->where(
+                'dm_conversation_participants.state',
+                $scope === 'requests' ? DmConversationParticipant::STATE_REQUEST : DmConversationParticipant::STATE_ACTIVE
+            )
+            ->when(! $includeGroups, fn ($q) => $q->where('dm_conversations.type', DmConversation::TYPE_DM))
+            ->when($scope === 'sent', fn ($q) => $q->where('dm_conversations.created_by_profile_id', $pid))
+            ->when($max_id, fn ($q) => $q->where('dm_conversations.last_message_id', '<', $max_id))
+            ->when($since_id, fn ($q) => $q->where('dm_conversations.last_message_id', '>', $since_id))
+            ->orderByDesc('dm_conversations.last_message_id')
+            ->limit($limit + 1)
+            ->get(['dm_conversation_participants.*', 'dm_conversations.last_message_id']);
+
+        $hasNextPage = $rows->count() > $limit;
+        $rows = $rows->take($limit);
+
+        $conversations = DmConversation::whereIn('id', $rows->pluck('conversation_id'))->get()->keyBy('id');
+        $members = DmConversationParticipant::whereIn('conversation_id', $rows->pluck('conversation_id'))
+            ->orderBy('id')
+            ->get()
+            ->groupBy('conversation_id');
+        $lastMessages = DmMessage::with('media')->whereIn('id', $rows->pluck('last_message_id'))->get()->keyBy('id');
+        $blocked = $payloads->blockedIds($pid);
+
+        $transformedDms = $rows->map(function ($row) use ($conversations, $members, $lastMessages, $blocked, $payloads, $pid) {
+            $conversation = $conversations->get($row->conversation_id);
+            $last = $lastMessages->get($conversation?->last_message_id);
+
+            if (! $conversation || ! $last || in_array((int) $last->profile_id, $blocked, true)) {
+                return null;
+            }
+
+            return $payloads->mastodonConversation($conversation, $row, $members->get($row->conversation_id, collect()), $last, $pid);
+        })->filter()->values();
+
+        $links = [];
+
+        if (! $transformedDms->isEmpty()) {
+            $baseUrl = url()->current().'?'.http_build_query(array_merge(
+                $request->except(['min_id', 'max_id', 'since_id']),
+                ['limit' => $limit]
+            ));
+
+            // Mastodon pages conversations by the id of their last status
+            $firstId = $transformedDms->first()['last_status']['id'];
+            $lastId = $transformedDms->last()['last_status']['id'];
+
+            $firstLink = $baseUrl;
+            $links[] = '<'.$firstLink.'>; rel="first"';
+
+            if ($hasNextPage) {
+                $nextLink = $baseUrl.'&max_id='.$lastId;
+                $links[] = '<'.$nextLink.'>; rel="next"';
+            }
+
+            if ($max_id || $since_id) {
+                $prevLink = $baseUrl.'&min_id='.$firstId;
+                $links[] = '<'.$prevLink.'>; rel="prev"';
+            }
+        }
+
+        if (! empty($links)) {
+            return response()->json($transformedDms->toArray())
+                ->header('Link', implode(', ', $links));
+        }
+
+        return $this->json($transformedDms);
+    }
+
+    /**
+     * DELETE /api/v1/conversations/{id}
+     *
+     * Removes the conversation from the caller's list. Nothing is deleted for
+     * the other participants.
+     */
+    public function conversationDelete(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $service = app(DirectMessageService::class);
+        $found = is_numeric($id) ? $service->conversationForMastodonId($id, $request->user()->profile_id) : null;
+        abort_if(! $found, 404);
+
+        $service->setHidden($found[1], true);
+
+        return $this->json([]);
+    }
+
+    /**
+     * POST /api/v1/conversations/{id}/read
+     */
+    public function conversationRead(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $service = app(DirectMessageService::class);
+        $payloads = app(DirectMessagePayloadService::class);
+        $pid = $request->user()->profile_id;
+
+        $found = is_numeric($id) ? $service->conversationForMastodonId($id, $pid) : null;
+        abort_if(! $found, 404);
+
+        [$conversation, $participant] = $found;
+
+        $service->markRead($participant);
+
+        $res = $payloads->mastodonConversation(
+            $conversation,
+            $participant,
+            DmConversationParticipant::where('conversation_id', $conversation->id)->orderBy('id')->get(),
+            $conversation->last_message_id ? DmMessage::with('media')->find($conversation->last_message_id) : null,
+            $pid
+        );
+
+        abort_if(! $res, 404);
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/statuses/{id}
+     *
+     * @param  int  $id
+     */
+    public function statusById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        AccountService::setLastActive($request->user()->id);
+        $pid = $request->user()->profile_id;
+
+        $res = $request->has(self::PF_API_ENTITY_KEY) ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
+        if (! $res || ! isset($res['visibility'])) {
+            // Direct messages are no longer statuses, but clients still take
+            // the id they got from /api/v1/conversations to this endpoint
+            $direct = app(DirectMessagePayloadService::class)->mastodonStatusById($id, $pid);
+
+            if ($direct) {
+                return $this->json($direct);
+            }
+
+            abort(404);
+        }
+
+        if ($res && isset($res['account'], $res['account']['acct'], $res['account']['url']) && strpos($res['account']['acct'], '@') != -1) {
+            $domain = parse_url($res['account']['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+
+        $scope = $res['visibility'];
+        if (! in_array($scope, ['public', 'unlisted'])) {
+            if ($scope === 'private') {
+                if (intval($res['account']['id']) !== intval($pid)) {
+                    abort_unless(FollowerService::follows($pid, $res['account']['id']), 403);
+                }
+            } else {
+                abort(400, 'Invalid request');
+            }
+        }
+
+        if (! empty($res['reblog']) && isset($res['reblog']['id'])) {
+            $res['reblog']['favourited'] = (bool) LikeService::liked($pid, $res['reblog']['id']);
+            $res['reblog']['reblogged'] = (bool) ReblogService::get($pid, $res['reblog']['id']);
+            $res['reblog']['bookmarked'] = BookmarkService::get($pid, $res['reblog']['id']);
+        }
+
+        $res['favourited'] = LikeService::liked($pid, $res['id']);
+        $res['reblogged'] = ReblogService::get($pid, $res['id']);
+        $res['bookmarked'] = BookmarkService::get($pid, $res['id']);
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/statuses/{id}/context
+     *
+     * @param  int  $id
+     */
+    public function statusContext(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $user = $request->user();
+        $pid = $user->profile_id;
+        $pe = $request->has(self::PF_API_ENTITY_KEY);
+
+        $status = StatusService::getMastodon(
+            $id,
+            false,
+            $pid
+        );
+
+        if (! $status || ! isset($status['account'])) {
+            $direct = app(DirectMessagePayloadService::class)->mastodonContext($id, $pid);
+
+            if ($direct) {
+                return $this->json($direct);
+            }
+
+            return response('', 404);
+        }
+
+        if (
+            isset($status['account']['acct']) &&
+            str_contains($status['account']['acct'], '@')
+        ) {
+            $domain = parse_url(
+                $status['account']['url'],
+                PHP_URL_HOST
+            );
+
+            abort_if(
+                in_array($domain, InstanceService::getBannedDomains()),
+                404
+            );
+        }
+
+        $filters = UserFilterService::filters($pid);
+
+        $ancestors = [];
+        $descendants = [];
+
+        if ($status['in_reply_to_id']) {
+            $ancestor = $pe
+                ? StatusService::get(
+                    $status['in_reply_to_id'],
+                    false,
+                    false,
+                    $pid
+                )
+                : StatusService::getMastodon(
+                    $status['in_reply_to_id'],
+                    false,
+                    $pid
+                );
+
+            if (
+                $ancestor &&
+                isset($ancestor['account']['id']) &&
+                ! in_array($ancestor['account']['id'], $filters)
+            ) {
+                $ancestors[] = $ancestor;
+            }
+        }
+
+        if ($status['replies_count']) {
+            $parentOwnerId = $status['account']['id'];
+            $parentScope = $status['visibility'];
+
+            $descendants = DB::table('statuses')
+                ->select(['id', 'profile_id', 'scope', 'local'])
+                ->where('in_reply_to_id', $id)
+                ->whereNull('deleted_at')
+                ->whereIn('scope', ['public', 'unlisted', 'private'])
+                ->orderBy('id')
+                ->limit(100)
+                ->get()
+                ->filter(function ($row) use ($filters, $pid, $parentOwnerId, $parentScope) {
+                    return ! in_array($row->profile_id, $filters) &&
+                        StatusService::isReplyVisibleTo(
+                            $row->profile_id,
+                            $row->scope,
+                            $row->local,
+                            $parentOwnerId,
+                            $parentScope,
+                            $pid
+                        );
+                })
+                ->take(20)
+                ->map(function ($row) use ($pe) {
+                    return $pe
+                        ? StatusService::get($row->id, false)
+                        : StatusService::getMastodon($row->id, false);
+                })
+                ->filter(function ($post) {
+                    return $post && isset($post['account']['id']);
+                })
+                ->map(function ($status) use ($pid) {
+                    $status['favourited'] = LikeService::liked(
+                        $pid,
+                        $status['id']
+                    );
+
+                    $status['reblogged'] = ReblogService::get(
+                        $pid,
+                        $status['id']
+                    );
+
+                    return $status;
+                })
+                ->values();
+        }
+
+        return $this->json([
+            'ancestors' => $ancestors,
+            'descendants' => $descendants,
+        ]);
+    }
+
+    /**
+     * GET /api/v1/statuses/{id}/card
+     *
+     * @param  int  $id
+     */
+    public function statusCard(Request $request, $id): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $res = [];
+
+        return response()->json($res);
+    }
+
+    /**
+     * GET /api/v1/statuses/{id}/reblogged_by
+     *
+     * @param  int  $id
+     */
+    public function statusRebloggedBy(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1|max:80',
+        ]);
+
+        $limit = $request->input('limit', 10);
+        $user = $request->user();
+        $pid = $user->profile_id;
+        $status = Status::findOrFail($id);
+        $account = AccountService::get($status->profile_id, true);
+        abort_if(! $account, 404);
+        abort_if(isset($account['moved'], $account['moved']['id']), 404, 'Account moved');
+        if ($account && strpos($account['acct'], '@') != -1) {
+            $domain = parse_url($account['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+        $author = intval($status->profile_id) === intval($pid) || $user->is_admin;
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+
+        abort_if(
+            ! $status->type ||
+                ! in_array($status->type, ['photo', 'photo:album', 'photo:video:album', 'reply', 'text', 'video', 'video:album']),
+            404,
+        );
+
+        if (! $author) {
+            if ($status->scope == 'private') {
+                abort_if(! FollowerService::follows($pid, $status->profile_id), 403);
+            } else {
+                abort_if(! in_array($status->scope, ['public', 'unlisted']), 403);
+            }
+
+            if ($request->has('cursor')) {
+                return $this->json([]);
+            }
+        }
+
+        $res = Status::where('reblog_of_id', $status->id)
+            ->orderByDesc('id')
+            ->cursorPaginate($limit)
+            ->withQueryString();
+
+        if (! $res) {
+            return $this->json([]);
+        }
+
+        $headers = [];
+        if ($author && $res->hasPages()) {
+            $links = '';
+            if ($res->onFirstPage()) {
+                if ($res->nextPageUrl()) {
+                    $links = '<'.$res->nextPageUrl().'>; rel="prev"';
+                }
+            } else {
+                if ($res->previousPageUrl()) {
+                    $links = '<'.$res->previousPageUrl().'>; rel="next"';
+                }
+
+                if ($res->nextPageUrl()) {
+                    if (! empty($links)) {
+                        $links .= ', ';
+                    }
+                    $links .= '<'.$res->nextPageUrl().'>; rel="prev"';
+                }
+            }
+
+            $headers = ['Link' => $links];
+        }
+
+        $res = $res->map(function ($status) use ($pid, $napi) {
+            $account = $napi ? AccountService::get($status->profile_id, true) : AccountService::getMastodon($status->profile_id, true);
+            if (! $account) {
+                return false;
+            }
+            if ($napi) {
+                $account['follows'] = $status->profile_id == $pid ? null : FollowerService::follows($pid, $status->profile_id);
+            }
+
+            return $account;
+        })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values();
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * GET /api/v1/statuses/{id}/favourited_by
+     *
+     * @param  int  $id
+     */
+    public function statusFavouritedBy(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+        ]);
+
+        $limit = $request->input('limit', 40);
+        if ($limit > 80) {
+            $limit = 80;
+        }
+        $user = $request->user();
+        $pid = $user->profile_id;
+        $status = Status::findOrFail($id);
+        $account = AccountService::get($status->profile_id, true);
+        abort_if(! $account, 404);
+        abort_if(isset($account['moved'], $account['moved']['id']), 404, 'Account moved');
+        if ($account && strpos($account['acct'], '@') != -1) {
+            $domain = parse_url($account['url'], PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+        $author = intval($status->profile_id) === intval($pid) || $user->is_admin;
+        $napi = $request->has(self::PF_API_ENTITY_KEY);
+
+        abort_if(
+            ! $status->type ||
+                ! in_array($status->type, ['photo', 'photo:album', 'photo:video:album', 'reply', 'text', 'video', 'video:album']),
+            404,
+        );
+
+        if (! $author) {
+            if ($status->scope == 'private') {
+                abort_if(! FollowerService::follows($pid, $status->profile_id), 403);
+            } else {
+                abort_if(! in_array($status->scope, ['public', 'unlisted']), 403);
+            }
+
+            if ($request->has('cursor')) {
+                return $this->json([]);
+            }
+        }
+
+        $res = Like::where('status_id', $status->id)
+            ->orderByDesc('id')
+            ->cursorPaginate($limit)
+            ->withQueryString();
+
+        if (! $res) {
+            return $this->json([]);
+        }
+
+        $headers = [];
+        if ($author && $res->hasPages()) {
+            $links = '';
+
+            if ($res->onFirstPage()) {
+                if ($res->nextPageUrl()) {
+                    $links = '<'.$res->nextPageUrl().'>; rel="prev"';
+                }
+            } else {
+                if ($res->previousPageUrl()) {
+                    $links = '<'.$res->previousPageUrl().'>; rel="next"';
+                }
+
+                if ($res->nextPageUrl()) {
+                    if (! empty($links)) {
+                        $links .= ', ';
+                    }
+                    $links .= '<'.$res->nextPageUrl().'>; rel="prev"';
+                }
+            }
+
+            $headers = ['Link' => $links];
+        }
+
+        $res = $res->map(function ($like) use ($pid, $napi) {
+            $account = $napi ? AccountService::get($like->profile_id, true) : AccountService::getMastodon($like->profile_id, true);
+            if (! $account) {
+                return false;
+            }
+
+            if ($napi) {
+                $account['follows'] = $like->profile_id == $pid ? null : FollowerService::follows($pid, $like->profile_id);
+            }
+
+            return $account;
+        })
+            ->filter(function ($account) {
+                return $account && isset($account['id']);
+            })
+            ->values();
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * POST /api/v1/statuses
+     */
+    public function statusCreate(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $this->validate($request, [
+            'status' => 'nullable|string|max:'.(int) config_cache('pixelfed.max_caption_length'),
+            'in_reply_to_id' => 'nullable',
+            'media_ids' => 'sometimes|array|max:'.(int) config_cache('pixelfed.max_album_length'),
+            'sensitive' => 'nullable',
+            'visibility' => 'string|in:private,unlisted,public,direct',
+            'spoiler_text' => 'sometimes|max:140',
+            'place_id' => 'sometimes|integer|min:1|max:128769',
+            'collection_ids' => 'sometimes|array|max:3',
+            'comments_disabled' => 'sometimes|boolean',
+            'quote_approval_policy' => 'sometimes|nullable|string|in:public,followers,nobody',
+            '_pe' => 'sometimes',
+        ]);
+
+        if ($request->filled('visibility') && $request->input('visibility') === 'direct') {
+            return $this->json([
+                'error' => 'Direct visibility is not available.',
+            ], 400);
+        }
+
+        $pe = $request->has(self::PF_API_ENTITY_KEY);
+        $idempotencyKey = null;
+
+        if ($request->hasHeader('idempotency-key')) {
+            $idempotencyKey = 'pf:api:v1:status:idempotency-key:'.$request->user()->id.':'.hash('sha1', $request->header('idempotency-key'));
+
+            $existing = Cache::get($idempotencyKey);
+            if (is_numeric($existing)) {
+                $res = $pe ? StatusService::get($existing, false) : StatusService::getMastodon($existing, false);
+                if ($res) {
+                    return $this->json($this->decorateNewStatus($res));
+                }
+                Cache::forget($idempotencyKey);
+            }
+
+            abort_unless(Cache::add($idempotencyKey, 'pending', 60), 409, 'Request already in progress.');
+        }
+
+        try {
+            return $this->storeStatus($request, $pe, $idempotencyKey);
+        } finally {
+            if ($idempotencyKey && Cache::get($idempotencyKey) === 'pending') {
+                Cache::forget($idempotencyKey);
+            }
+        }
+    }
+
+    protected function decorateNewStatus(array $res): array
+    {
+        $res['favourited'] = false;
+        $res['language'] = 'en';
+        $res['bookmarked'] = false;
+        $res['card'] = null;
+
+        return $res;
+    }
+
+    protected function storeStatus(Request $request, bool $pe, ?string $idempotencyKey)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $this->validate($request, [
+            'status' => 'nullable|string|max:'.(int) config_cache('pixelfed.max_caption_length'),
+            'in_reply_to_id' => 'nullable',
+            'media_ids' => 'sometimes|array|max:'.(int) config_cache('pixelfed.max_album_length'),
+            'sensitive' => 'nullable',
+            'visibility' => 'string|in:private,unlisted,public,direct',
+            'spoiler_text' => 'sometimes|max:140',
+            'place_id' => 'sometimes|integer|min:1|max:128769',
+            'collection_ids' => 'sometimes|array|max:3',
+            'comments_disabled' => 'sometimes|boolean',
+            'quote_approval_policy' => 'sometimes|nullable|string|in:public,followers,nobody',
+            '_pe' => 'sometimes',
+        ]);
+
+        if ($request->filled('visibility') && $request->input('visibility') === 'direct') {
+            return $this->json([
+                'error' => 'Direct visibility is not available.',
+            ], 400);
+        }
+
+        if (config('costar.enabled') == true) {
+            $blockedKeywords = config('costar.keyword.block');
+            if ($blockedKeywords !== null && $request->status) {
+                $keywords = config('costar.keyword.block');
+                foreach ($keywords as $kw) {
+                    if (Str::contains($request->status, $kw) == true) {
+                        abort(400, 'Invalid object. Contains banned keyword.');
+                    }
+                }
+            }
+        }
+
+        if (! $request->filled('media_ids') && ! $request->filled('in_reply_to_id')) {
+            abort(403, 'Empty statuses are not allowed');
+        }
+
+        $ids = $request->input('media_ids');
+        $in_reply_to_id = $request->input('in_reply_to_id');
+
+        $user = $request->user();
+
+        if ($user->has_roles) {
+            if ($in_reply_to_id != null) {
+                abort_if(! UserRoleService::can('can-comment', $user->id), 403, 'Invalid permissions for this action');
+            } else {
+                abort_if(! UserRoleService::can('can-post', $user->id), 403, 'Invalid permissions for this action');
+            }
+        }
+
+        $profile = $user->profile;
+        $limitKey = 'compose:rate-limit:store:'.$user->id;
+        $limitTtl = now()->addMinutes(15);
+        $limitReached = Cache::remember($limitKey, $limitTtl, function () use ($user) {
+            $minId = SnowflakeService::byDate(now()->subDays(1));
+            $dailyLimit = Status::whereProfileId($user->profile_id)
+                ->where('id', '>', $minId)
+                ->count();
+
+            return $dailyLimit >= 1000;
+        });
+
+        abort_if($limitReached == true, 429);
+
+        $visibility = $profile->is_private ? 'private' : (
+            $profile->unlisted == true &&
+            $request->input('visibility', 'public') == 'public' ?
+            'unlisted' :
+            $request->input('visibility', 'public'));
+
+        if ($user->last_active_at == null) {
+            return [];
+        }
+
+        $defaultCaption = '';
+        $content = $request->filled('status') ? strip_tags($request->input('status')) : $defaultCaption;
+        $cw = $user->profile->cw == true ? true : $request->boolean('sensitive', false);
+        $spoilerText = $cw && $request->filled('spoiler_text') ? $request->input('spoiler_text') : null;
+
+        $status = null;
+        $parent = null;
+
+        $quotePolicy = QuoteService::fromApiPolicy($request->input('quote_approval_policy'));
+
+        if ($in_reply_to_id) {
+            $parent = Status::findOrFail($in_reply_to_id);
+
+            abort_unless(
+                StatusService::isVisibleTo(
+                    $parent->profile_id,
+                    $parent->scope,
+                    $profile->id
+                ),
+                404
+            );
+            if ($parent->comments_disabled) {
+                return $this->json('Comments have been disabled on this post', 422);
+            }
+            $blocks = UserFilterService::blocks($parent->profile_id);
+            abort_if(in_array($profile->id, $blocks), 422, 'Cannot reply to this post at this time.');
+
+            $visibility = StatusService::clampReplyVisibility(
+                $visibility,
+                $parent->scope
+            );
+
+            $status = new Status;
+            $status->caption = $content;
+            $status->rendered = $defaultCaption;
+            $status->scope = $visibility;
+            $status->visibility = $visibility;
+            $status->profile_id = $user->profile_id;
+            $status->is_nsfw = $cw;
+            $status->cw_summary = $spoilerText;
+            $status->in_reply_to_id = $parent->id;
+            $status->in_reply_to_profile_id = $parent->profile_id;
+            $status->quote_policy = $quotePolicy;
+            $status->save();
+            StatusService::del($parent->id);
+            Cache::forget('status:replies:all:'.$parent->id);
+        }
+
+        if ($ids) {
+            if (
+                Media::whereUserId($user->id)
+                    ->whereNull('status_id')
+                    ->notInDirectMessage()
+                    ->find($ids)
+                    ->count() == 0
+            ) {
+                abort(400, 'Invalid media_ids');
+            }
+
+            if (! $in_reply_to_id) {
+                $status = new Status;
+                $status->caption = $content;
+                $status->rendered = $defaultCaption;
+                $status->profile_id = $user->profile_id;
+                $status->is_nsfw = $cw;
+                $status->cw_summary = $spoilerText;
+                $status->scope = 'draft';
+                $status->visibility = 'draft';
+                if ($request->has('place_id')) {
+                    $status->place_id = $request->input('place_id');
+                    PlaceService::clearStatusesByPlaceId($request->input('place_id'));
+                }
+                $status->save();
+            }
+
+            $mimes = [];
+
+            foreach ($ids as $k => $v) {
+                if ($k + 1 > (int) config_cache('pixelfed.max_album_length')) {
+                    continue;
+                }
+                $m = Media::whereUserId($user->id)->whereNull('status_id')->notInDirectMessage()->findOrFail($v);
+                if ($m->profile_id !== $user->profile_id || $m->status_id) {
+                    abort(403, 'Invalid media id');
+                }
+                $m->order = $k + 1;
+                $m->status_id = $status->id;
+                $m->save();
+                array_push($mimes, $m->mime);
+            }
+
+            if (empty($mimes)) {
+                $status->delete();
+                abort(400, 'Invalid media ids');
+            }
+
+            if ($request->has('comments_disabled') && $request->input('comments_disabled')) {
+                $status->comments_disabled = true;
+            }
+
+            $status->quote_policy = $quotePolicy;
+            $status->scope = $visibility;
+            $status->visibility = $visibility;
+            $status->type = StatusController::mimeTypeCheck($mimes);
+            $status->save();
+        }
+
+        if (! $status) {
+            abort(500, 'An error occured.');
+        }
+
+        if ($idempotencyKey) {
+            Cache::put($idempotencyKey, $status->id, 3600);
+        }
+        Cache::forget('pf:status:ap:v1:sid:'.$status->id);
+        Cache::forget('status:transformer:media:attachments:'.$status->id);
+        Cache::forget('user:account:id:'.$user->id);
+        Cache::forget('_api:statuses:recent_9:'.$user->profile_id);
+        Cache::forget('profile:status_count:'.$user->profile_id);
+        Cache::forget($user->storageUsedKey());
+        Cache::forget('profile:embed:'.$status->profile_id);
+        Cache::forget($limitKey);
+
+        NewStatusPipeline::dispatch($status);
+        if ($status->in_reply_to_id) {
+            CommentPipeline::dispatch($parent, $status);
+        }
+
+        if ($request->has('collection_ids') && $ids) {
+            $collections = Collection::whereProfileId($user->profile_id)
+                ->find($request->input('collection_ids'))
+                ->each(function ($collection) use ($status) {
+                    $count = $collection->items()->count();
+                    $item = CollectionItem::firstOrCreate([
+                        'collection_id' => $collection->id,
+                        'object_type' => Status::class,
+                        'object_id' => $status->id,
+                    ], [
+                        'order' => $count,
+                    ]);
+
+                    CollectionService::addItem(
+                        $collection->id,
+                        $status->id,
+                        $count
+                    );
+                    $collection->updated_at = now();
+                    $collection->save();
+                    CollectionService::setCollection($collection->id, $collection);
+                });
+        }
+
+        $res = $pe ? StatusService::get($status->id, false) : StatusService::getMastodon($status->id, false);
+
+        return $this->json($this->decorateNewStatus($res));
+    }
+
+    /**
+     * DELETE /api/v1/statuses
+     *
+     * @param  int  $id
+     */
+    public function statusDelete(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        AccountService::setLastActive($request->user()->id);
+        $pid = $request->user()->profile_id;
+        $status = Status::whereProfileId($pid)->find($id);
+
+        if (! $status) {
+            $message = DmMessage::where('profile_id', $pid)->find($id);
+            abort_if(! $message, 404);
+
+            $payloads = app(DirectMessagePayloadService::class);
+            $res = $payloads->mastodonStatusById($message->id, $pid);
+            abort_if(! $res, 404);
+
+            app(DirectMessageService::class)->deleteMessage($message);
+
+            $res['text'] = $res['content_text'];
+            unset($res['content']);
+
+            return $this->json($res);
+        }
+
+        $resource = new Fractal\Resource\Item($status, new StatusTransformer);
+
+        $res = $this->fractal->createData($resource)->toArray();
+
+        Cache::forget('_api:statuses:recent_9:'.$status->profile_id);
+        Cache::forget('profile:status_count:'.$status->profile_id);
+        Cache::forget('profile:embed:'.$status->profile_id);
+        StatusService::del($status->id, true);
+        StatusDelete::dispatch($status);
+
+        $res['text'] = $res['content'];
+        unset($res['content']);
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/statuses/{id}/reblog
+     *
+     * @param  int  $id
+     */
+    public function statusShare(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-share', $user->id), 403, 'Invalid permissions for this action');
+        AccountService::setLastActive($user->id);
+        $status = Status::whereScope('public')->findOrFail($id);
+        $account = AccountService::get($status->profile_id);
+        abort_if(isset($account['moved'], $account['moved']['id']), 422, 'Cannot share a post from an account that has migrated');
+        if ($status && ($status->uri || $status->url || $status->object_url)) {
+            $url = $status->uri ?? $status->url ?? $status->object_url;
+            $domain = parse_url($url, PHP_URL_HOST);
+            abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
+        }
+        if (intval($status->profile_id) !== intval($user->profile_id)) {
+            if ($status->scope == 'private') {
+                abort_if(! FollowerService::follows($user->profile_id, $status->profile_id), 403);
+            } else {
+                abort_if(! in_array($status->scope, ['public', 'unlisted']), 403);
+            }
+
+            $blocks = UserFilterService::blocks($status->profile_id);
+            if ($blocks && in_array($user->profile_id, $blocks)) {
+                abort(422);
+            }
+        }
+
+        $share = Status::firstOrCreate([
+            'caption' => '',
+            'rendered' => '',
+            'profile_id' => $user->profile_id,
+            'reblog_of_id' => $status->id,
+            'type' => 'share',
+            'in_reply_to_profile_id' => $status->profile_id,
+            'scope' => 'public',
+            'visibility' => 'public',
+        ]);
+
+        // Only run the share pipeline for a newly-created share; a duplicate
+        // reblog returns the existing row (matches the like-path pattern and
+        // avoids redundant queue work / counter churn).
+        if ($share->wasRecentlyCreated) {
+            SharePipeline::dispatch($share)->onQueue('low');
+        }
+
+        StatusService::del($status->id);
+        ReblogService::add($user->profile_id, $status->id);
+        $res = StatusService::getMastodon($status->id);
+        $res['reblogged'] = true;
+        $res['favourited'] = LikeService::liked($user->profile_id, $status->id);
+        $res['bookmarked'] = BookmarkService::get($user->profile_id, $status->id);
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/statuses/{id}/unreblog
+     *
+     * @param  int  $id
+     */
+    public function statusUnshare(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $user = $request->user();
+        abort_if($user->has_roles && ! UserRoleService::can('can-share', $user->id), 403, 'Invalid permissions for this action');
+        AccountService::setLastActive($user->id);
+        $status = Status::whereScope('public')->findOrFail($id);
+        $account = AccountService::get($status->profile_id);
+        abort_if(isset($account['moved'], $account['moved']['id']), 422, 'Cannot unshare a post from an account that has migrated');
+
+        if (intval($status->profile_id) !== intval($user->profile_id)) {
+            if ($status->scope == 'private') {
+                abort_if(! FollowerService::follows($user->profile_id, $status->profile_id), 403);
+            } else {
+                abort_if(! in_array($status->scope, ['public', 'unlisted']), 403);
+            }
+        }
+
+        $reblog = Status::whereProfileId($user->profile_id)
+            ->whereReblogOfId($status->id)
+            ->first();
+
+        if (! $reblog) {
+            $res = StatusService::getMastodon($status->id);
+            $res['reblogged'] = false;
+
+            return $this->json($res);
+        }
+
+        UndoSharePipeline::dispatch($reblog)->onQueue('low');
+        ReblogService::del($user->profile_id, $status->id);
+
+        $res = StatusService::getMastodon($status->id);
+        $res['reblogged'] = false;
+        $res['favourited'] = LikeService::liked($user->profile_id, $status->id);
+        $res['bookmarked'] = BookmarkService::get($user->profile_id, $status->id);
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/timelines/tag/{hashtag}
+     *
+     * @param  string  $hashtag
+     */
+    public function timelineHashtag(Request $request, $hashtag)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'page' => 'nullable|integer|max:40',
+            'cursor' => 'sometimes|string|max:2000',
+            'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
+            'limit' => 'sometimes|integer|min:1',
+            'only_media' => 'sometimes',
+            '_pe' => 'sometimes',
+        ]);
+
+        $user = $request->user();
+        abort_if(
+            $user->has_roles && ! UserRoleService::can('can-view-hashtag-feed', $user->id),
+            403,
+            'Invalid permissions for this action'
+        );
+
+        if (db_is_pgsql()) {
+            $tag = Hashtag::where('name', 'ilike', $hashtag)
+                ->orWhere('slug', 'ilike', $hashtag)
+                ->first();
+        } else {
+            $tag = Hashtag::whereName($hashtag)
+                ->orWhere('slug', $hashtag)
+                ->first();
+        }
+
+        if (! $tag) {
+            return response()->json([]);
+        }
+
+        if ($tag->is_banned == true) {
+            return $this->json([]);
+        }
+
+        $min = $request->input('min_id');
+        $max = $request->input('max_id');
+        $limit = min((int) $request->input('limit', 20), 40);
+        $onlyMedia = $request->boolean('only_media', true);
+        $pe = $request->has(self::PF_API_ENTITY_KEY);
+        $pid = (int) $user->profile_id;
+
+        $maxPages = (int) config('instance.timeline.tag.max_pages', 10);
+        $cursorTtl = (int) config('instance.timeline.tag.cursor_ttl', 3600);
+        $scanLimit = 100;
+
+        $ctx = hash('sha256', implode('|', [
+            $user->id,
+            'tag-timeline',
+            'hashtag:'.$tag->id,
+            'limit:'.$limit,
+            'only_media:'.(int) $onlyMedia,
+            'pe:'.(int) $pe,
+        ]));
+
+        $hops = 0;
+        $boundary = null;
+
+        if ($request->filled('cursor')) {
+            ['cursor' => $decoded, 'hops' => $hops] = CursorToken::decode($request->input('cursor'), $ctx);
+
+            if ($hops >= $maxPages || ! ctype_digit($decoded)) {
+                return $this->json([]);
+            }
+
+            $boundary = (int) $decoded;
+        } elseif ($max) {
+            return $this->json([]);
+        }
+
+        $sinceMode = ! $boundary && $min;
+
+        if ($sinceMode) {
+            $minMax = SnowflakeService::byDate(now()->subMonths(9));
+            if (intval($min) < $minMax) {
+                return $this->json([]);
+            }
+        }
+
+        $cachedFilters = CustomFilter::getCachedFiltersForAccount($pid);
+
+        $tagFilters = array_filter($cachedFilters, function ($item) {
+            [$filter, $rules] = $item;
+
+            return in_array('tags', $filter->context);
+        });
+
+        $filters = UserFilterService::filters($pid);
+        $domainBlocks = UserFilterService::domainBlocks($pid);
+
+        $ids = StatusHashtag::whereHashtagId($tag->id)
+            ->when($boundary, fn ($q) => $q->where('status_id', '<', $boundary))
+            ->when($sinceMode, fn ($q) => $q->where('status_id', '>', $min))
+            ->whereIn('status_visibility', ['public', 'unlisted'])
+            ->orderBy('status_id', 'desc')
+            ->limit($scanLimit)
+            ->pluck('status_id');
+
+        $res = [];
+        $lastScanned = null;
+
+        foreach ($ids as $sid) {
+            $lastScanned = $sid;
+
+            $status = $pe ? StatusService::get($sid, false) : StatusService::getMastodon($sid, false);
+
+            if (! $status || ! isset($status['account']['id'], $status['url'])) {
+                continue;
+            }
+
+            $authorId = (int) $status['account']['id'];
+
+            if ($status['visibility'] === 'unlisted' && $authorId !== $pid) {
+                continue;
+            }
+
+            if (
+                $status['visibility'] === 'private' &&
+                $authorId !== $pid &&
+                ! FollowerService::follows($pid, $status['account']['id'], true)
+            ) {
+                continue;
+            }
+
+            if ($onlyMedia && empty($status['media_attachments'])) {
+                continue;
+            }
+
+            if (in_array($status['account']['id'], $filters)) {
+                continue;
+            }
+
+            $domain = strtolower((string) parse_url($status['url'], PHP_URL_HOST));
+            if (in_array($domain, $domainBlocks)) {
+                continue;
+            }
+
+            $filterResults = CustomFilter::applyCachedFilters($tagFilters, $status);
+
+            if (! empty($filterResults)) {
+                $status['filtered'] = $filterResults;
+                $shouldHide = collect($filterResults)->contains(function ($result) {
+                    return $result['filter']['filter_action'] === 'hide';
+                });
+
+                if ($shouldHide) {
+                    continue;
+                }
+            }
+
+            $res[] = $status;
+
+            if (count($res) >= $limit) {
+                break;
+            }
+        }
+
+        $hasMore = count($res) >= $limit || $ids->count() >= $scanLimit;
+
+        $baseUrl = $request->url();
+        $shared = [
+            'limit' => $limit,
+            'only_media' => $onlyMedia ? 'true' : 'false',
+        ];
+        if ($pe) {
+            $shared[self::PF_API_ENTITY_KEY] = 1;
+        }
+
+        $links = [];
+
+        if (! $sinceMode && $hasMore && $lastScanned && ($hops + 1) < $maxPages) {
+            $token = CursorToken::encode((string) $lastScanned, $ctx, $hops + 1, $cursorTtl);
+            $links[] = '<'.$baseUrl.'?'.http_build_query($shared + ['cursor' => $token]).'>; rel="next"';
+        }
+
+        if (! empty($res)) {
+            $links[] = '<'.$baseUrl.'?'.http_build_query($shared + ['min_id' => $res[0]['id']]).'>; rel="prev"';
+        }
+
+        $headers = empty($links) ? [] : ['Link' => implode(', ', $links)];
+
+        return $this->json($res, 200, $headers);
+    }
+
+    /**
+     * GET /api/v1/bookmarks
+     */
+    public function bookmarks(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+            'cursor' => 'sometimes|string',
+        ]);
+
+        $pe = $request->has('_pe');
+        $pid = $request->user()->profile_id;
+        $limit = min((int) $request->input('limit', 20), 40);
+
+        $query = ['limit' => $limit];
+
+        if ($pe) {
+            $query['_pe'] = 1;
+        }
+
+        $page = Bookmark::query()
+            ->select('id', 'status_id')
+            ->where('profile_id', $pid)
+            ->orderByDesc('id')
+            ->cursorPaginate($limit)
+            ->appends($query);
+
+        $statusIds = $page->pluck('status_id')->all();
+
+        if (! $statusIds) {
+            return $this->json([]);
+        }
+
+        $liked = Like::where('profile_id', $pid)
+            ->whereIn('status_id', $statusIds)
+            ->pluck('status_id')
+            ->flip()
+            ->all();
+
+        $reblogged = Status::where('profile_id', $pid)
+            ->whereIn('reblog_of_id', $statusIds)
+            ->pluck('reblog_of_id')
+            ->flip()
+            ->all();
+
+        $bookmarks = [];
+
+        foreach ($statusIds as $statusId) {
+            $status = $pe
+                ? StatusService::get($statusId, false, false, $pid)
+                : StatusService::getMastodon($statusId, false, $pid);
+
+            if (! $status) {
+                continue;
+            }
+
+            $status['bookmarked'] = true;
+            $status['favourited'] = isset($liked[$statusId]);
+            $status['reblogged'] = isset($reblogged[$statusId]);
+
+            $bookmarks[] = $status;
+        }
+
+        $links = [];
+
+        if ($page->nextCursor()) {
+            $links[] = '<'.$page->nextPageUrl().'>; rel="next"';
+        }
+
+        if ($page->previousCursor()) {
+            $links[] = '<'.$page->previousPageUrl().'>; rel="prev"';
+        }
+
+        $headers = $links ? ['Link' => implode(', ', $links)] : [];
+
+        return $this->json($bookmarks, 200, $headers);
+    }
+
+    /**
+     * POST /api/v1/statuses/{id}/bookmark
+     */
+    public function bookmarkStatus(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $status = Status::findOrFail($id);
+        $user = $request->user();
+        $pid = $request->user()->profile_id;
+        $account = AccountService::get($status->profile_id);
+        abort_if(isset($account['moved'], $account['moved']['id']), 422, 'Cannot bookmark a post from an account that has migrated');
+        abort_if($user->has_roles && ! UserRoleService::can('can-bookmark', $user->id), 403, 'Invalid permissions for this action');
+
+        if (Bookmark::whereStatusId($status->id)->whereProfileId($pid)->exists()) {
+            BookmarkService::add($pid, $status->id);
+
+            $res = StatusService::getMastodon($status->id, false);
+            $res['bookmarked'] = true;
+
+            return $this->json($res);
+        }
+
+        abort_if($status->in_reply_to_id || $status->reblog_of_id, 404);
+        abort_if(! in_array($status->scope, ['public', 'unlisted', 'private']), 404);
+        abort_if(! in_array($status->type, ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album']), 404);
+
+        if ($status->scope == 'private') {
+            abort_if(
+                $pid !== $status->profile_id && ! FollowerService::follows($pid, $status->profile_id),
+                404,
+                'Error: You cannot bookmark private posts from accounts you do not follow.'
+            );
+        }
+
+        Bookmark::firstOrCreate([
+            'status_id' => $status->id,
+            'profile_id' => $pid,
+        ]);
+
+        BookmarkService::add($pid, $status->id);
+
+        $res = StatusService::getMastodon($status->id, false);
+        $res['bookmarked'] = true;
+
+        return $this->json($res);
+    }
+
+    /**
+     * POST /api/v1/statuses/{id}/unbookmark
+     */
+    public function unbookmarkStatus(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $status = Status::findOrFail($id);
+        $pid = $request->user()->profile_id;
+        $user = $request->user();
+
+        abort_if($user->has_roles && ! UserRoleService::can('can-bookmark', $user->id), 403, 'Invalid permissions for this action');
+
+        $bookmark = Bookmark::whereStatusId($status->id)
+            ->whereProfileId($pid)
+            ->first();
+
+        if ($bookmark) {
+            BookmarkService::del($pid, $status->id);
+            $bookmark->delete();
+        }
+
+        if ($status->scope == 'private') {
+            abort_if(
+                $pid !== $status->profile_id && ! FollowerService::follows($pid, $status->profile_id),
+                404,
+                'Error: You cannot view private posts from accounts you do not follow.'
+            );
+        }
+
+        $res = StatusService::getMastodon($status->id, false, $pid);
+        abort_if(! $res, 404, 'Record does not exist.');
+        $res['bookmarked'] = false;
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v1/discover/posts
+     */
+    public function discoverPosts(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $this->validate($request, [
+            'limit' => 'integer|min:1|max:40',
+        ]);
+
+        $limit = $request->input('limit', 40);
+        $pid = $request->user()->profile_id;
+        $filters = UserFilterService::filters($pid);
+        $forYou = DiscoverService::getForYou();
+        $posts = $forYou->take(50)->map(function ($post) {
+            return StatusService::getMastodon($post);
+        })
+            ->filter(function ($post) use ($filters) {
+                return $post &&
+                    isset($post['account']) &&
+                    isset($post['account']['id']) &&
+                    ! in_array($post['account']['id'], $filters);
+            })
+            ->take(12)
+            ->values();
+
+        return $this->json(['posts' => $posts]);
+    }
+
+    /**
+     * GET /api/v2/statuses/{id}/replies
+     */
+    public function statusReplies(Request $request, $id)
+    {
+        abort_if(! $request->user(), 403);
+
+        $this->validate($request, [
+            'limit' => 'sometimes|integer|min:1',
+            'sort' => 'in:all,newest,popular',
+        ]);
+
+        $limit = $request->input('limit', 3);
+        if ($limit > 10) {
+            $limit = 10;
+        }
+        $pid = $request->user()->profile_id;
+        $status = StatusService::getMastodon(
+            $id,
+            false,
+            $pid
+        );
+
+        abort_if(! $status, 404);
+        abort_if(isset($status['account'], $status['account']['moved'], $status['account']['moved']['id']), 404, 'Account moved');
+
+        $sortBy = $request->input('sort', 'all');
+
+        if ($sortBy == 'all' && isset($status['replies_count']) && $status['replies_count'] && $request->has('refresh_cache')) {
+            if (! Cache::has('status:replies:all-rc:'.$id)) {
+                Cache::forget('status:replies:all:'.$id);
+                Cache::put('status:replies:all-rc:'.$id, true, 300);
+            }
+        }
+
+        if ($sortBy == 'all' && ! $request->has('cursor')) {
+            $ids = Cache::remember('status:replies:all:'.$id, 3600, function () use ($id) {
+                return DB::table('statuses')
+                    ->where('in_reply_to_id', $id)
+                    ->orderBy('id')
+                    ->cursorPaginate(3);
+            });
+        } else {
+            $ids = DB::table('statuses')
+                ->where('in_reply_to_id', $id)
+                ->when($sortBy, function ($q, $sortBy) {
+                    if ($sortBy === 'all') {
+                        return $q->orderBy('id');
+                    }
+
+                    if ($sortBy === 'newest') {
+                        return $q->orderByDesc('created_at');
+                    }
+
+                    if ($sortBy === 'popular') {
+                        return $q->orderByDesc('likes_count');
+                    }
+                })
+                ->cursorPaginate($limit);
+        }
+
+        $filters = UserFilterService::filters($pid);
+        $data = $ids->filter(function ($post) use ($filters) {
+            return ! in_array($post->profile_id, $filters);
+        })
+            ->map(function ($post) use ($pid) {
+                $status = StatusService::get(
+                    $post->id,
+                    false,
+                    false,
+                    $pid
+                );
+
+                if (! $status || ! isset($status['id'])) {
+                    return false;
+                }
+
+                $status['favourited'] = LikeService::liked($pid, $post->id);
+
+                return $status;
+            })
+            ->map(function ($post) {
+                if (isset($post['account']) && isset($post['account']['id'])) {
+                    $account = AccountService::get($post['account']['id'], true);
+                    $post['account'] = $account;
+                }
+
+                return $post;
+            })
+            ->filter(function ($post) {
+                return $post && isset($post['id']) && isset($post['account']) && isset($post['account']['id']);
+            })
+            ->values();
+
+        $res = [
+            'data' => $data,
+            'next' => $ids->nextPageUrl(),
+        ];
+
+        return $this->json($res);
+    }
+
+    /**
+     * GET /api/v2/statuses/{id}/state
+     */
+    public function statusState(Request $request, $id)
+    {
+        abort_if(! $request->user(), 403);
+
+        $status = StatusService::get($id, false, true);
+        abort_if(! $status, 404);
+        abort_if(! in_array($status['visibility'], ['public', 'unlisted', 'private']), 404);
+
+        return $this->json(StatusService::getState($status['id'], $request->user()->profile_id));
+    }
+
+    /**
+     * GET /api/v1.1/discover/accounts/popular
+     */
+    public function discoverAccountsPopular(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $pid = $request->user()->profile_id;
+
+        $pool = Cache::remember('api:v1.1:discover:accounts:popular:pool:v1', 14400, function () {
+            return DB::table('profiles')
+                ->where('is_private', false)
+                ->whereNull('status')
+                ->orderByDesc('followers_count')
+                ->limit(200)
+                ->pluck('id')
+                ->toArray();
+        });
+
+        $following = DB::table('followers')
+            ->where('profile_id', $pid)
+            ->whereIn('following_id', $pool)
+            ->pluck('following_id')
+            ->toArray();
+
+        $requested = DB::table('follow_requests')
+            ->where('follower_id', $pid)
+            ->whereIn('following_id', $pool)
+            ->pluck('following_id')
+            ->toArray();
+
+        $exclude = array_flip(array_merge(
+            [$pid],
+            $following,
+            $requested,
+            UserFilterService::filters($pid),
+            AdminShadowFilterService::getHideFromPublicFeedsList()
+        ));
+
+        $res = collect($pool)
+            ->reject(fn ($id): bool => isset($exclude[$id]))
+            ->take(50)
+            ->map(fn ($id) => AccountService::get($id, true))
+            ->filter()
+            ->take(16)
+            ->values();
+
+        return $this->json($res);
+    }
+
+    public function discoverAccountsPopularV2(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $pid = $request->user()->profile_id;
+        $limit = max(1, min((int) $request->input('limit', 16), 40));
+
+        $cursor = Cursor::fromEncoded($request->input('cursor'));
+        if ($cursor && ! isset($cursor->toArray()['followers_count'], $cursor->toArray()['id'])) {
+            $cursor = null;
+        }
+
+        $pool = Cache::remember('api:v1.1:discover:accounts:popular:pool:v2', 14400, function () {
+            return DB::table('profiles')
+                ->select('id', 'followers_count')
+                ->where('is_private', false)
+                ->whereNull('status')
+                ->orderByDesc('followers_count')
+                ->orderByDesc('id')
+                ->limit(200)
+                ->get()
+                ->map(fn ($p): array => [
+                    'id' => (int) $p->id,
+                    'followers_count' => (int) $p->followers_count,
+                ])
+                ->all();
+        });
+
+        $poolIds = array_column($pool, 'id');
+
+        $following = DB::table('followers')
+            ->where('profile_id', $pid)
+            ->whereIn('following_id', $poolIds)
+            ->pluck('following_id')
+            ->all();
+
+        $requested = DB::table('follow_requests')
+            ->where('follower_id', $pid)
+            ->whereIn('following_id', $poolIds)
+            ->pluck('following_id')
+            ->all();
+
+        $exclude = array_flip(array_merge(
+            [$pid],
+            $following,
+            $requested,
+            UserFilterService::filters($pid),
+            AdminShadowFilterService::getHideFromPublicFeedsList()
+        ));
+
+        $candidates = collect($pool)->reject(fn ($p): bool => isset($exclude[$p['id']]));
+
+        if ($cursor) {
+            [$afterCount, $afterId] = array_map('intval', $cursor->parameters(['followers_count', 'id']));
+            $candidates = $candidates->filter(
+                fn ($p): bool => $p['followers_count'] < $afterCount
+                    || ($p['followers_count'] === $afterCount && $p['id'] < $afterId)
+            );
+        }
+
+        $paginator = (new CursorPaginator(
+            $candidates->take($limit + 1)->values(),
+            $limit,
+            $cursor,
+            ['path' => $request->url(), 'parameters' => ['followers_count', 'id']]
+        ))->withQueryString();
+
+        $accounts = collect($paginator->items())
+            ->map(fn ($p) => AccountService::get($p['id'], true))
+            ->filter()
+            ->values();
+
+        $headers = $paginator->hasMorePages()
+            ? ['Link' => '<'.$paginator->nextPageUrl().'>; rel="next"']
+            : [];
+
+        return $this->json($accounts)->withHeaders($headers);
+    }
+
+    /**
+     * GET /api/v1/preferences
+     */
+    public function getPreferences(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $pid = $request->user()->profile_id;
+        $account = AccountService::get($pid);
+
+        return $this->json([
+            'posting:default:visibility' => $account['locked'] ? 'private' : 'public',
+            'posting:default:sensitive' => false,
+            'posting:default:language' => null,
+            'reading:expand:media' => 'default',
+            'reading:expand:spoilers' => false,
+        ]);
+    }
+
+    /**
+     * GET /api/v1/trends
+     */
+    public function getTrends(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return $this->json([]);
+    }
+
+    /**
+     * GET /api/v1/announcements
+     */
+    public function getAnnouncements(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        return $this->json([]);
+    }
+
+    /**
+     * GET /api/v1/markers
+     */
+    public function getMarkers(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('read'), 403);
+
+        $type = $request->input('timeline');
+        if (is_array($type)) {
+            $type = $type[0];
+        }
+        if (! $type || ! in_array($type, ['home', 'notifications'])) {
+            return $this->json([]);
+        }
+        $pid = $request->user()->profile_id;
+
+        return $this->json(MarkerService::get($pid, $type));
+    }
+
+    /**
+     * POST /api/v1/markers
+     */
+    public function setMarkers(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $pid = $request->user()->profile_id;
+        $home = $request->input('home.last_read_id');
+        $notifications = $request->input('notifications.last_read_id');
+
+        if ($home) {
+            return $this->json(MarkerService::set($pid, 'home', $home));
+        }
+
+        if ($notifications) {
+            return $this->json(MarkerService::set($pid, 'notifications', $notifications));
+        }
+
+        return $this->json([]);
+    }
+
+    /**
+     * GET /api/v1/instance/peers
+     */
+    public function instancePeers(Request $request)
+    {
+        if ((bool) config('instance.show_peers') === false) {
+            return $this->json([]);
+        }
+
+        return $this->json(
+            Cache::remember(InstanceService::CACHE_KEY_API_PEERS_LIST, now()->addHours(24), function () {
+                return Instance::whereNotNull('nodeinfo_last_fetched')
+                    ->whereBanned(false)
+                    ->where('nodeinfo_last_fetched', '>', now()->subDays(8))
+                    ->pluck('domain');
+            })
+        );
+    }
+
+    public function accountRemoveFollowById(Request $request, $id)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('follow'), 403);
+
+        $pid = $request->user()->profile_id;
+
+        if ($pid === $id) {
+            return $this->json(['error' => 'Request invalid! target_id is same user id.'], 500);
+        }
+
+        $exists = Follower::whereProfileId($id)
+            ->whereFollowingId($pid)
+            ->first();
+
+        abort_unless($exists, 404);
+
+        $exists->delete();
+
+        RelationshipService::refresh($pid, $id);
+        RelationshipService::refresh($pid, $id);
+
+        UnfollowPipeline::dispatch($id, $pid)->onQueue('high');
+
+        Cache::forget('profile:following:'.$id);
+        Cache::forget('profile:followers:'.$id);
+        Cache::forget('profile:following:'.$pid);
+        Cache::forget('profile:followers:'.$pid);
+        Cache::forget('api:local:exp:rec:'.$pid);
+        Cache::forget('user:account:id:'.$id);
+        Cache::forget('user:account:id:'.$pid);
+        Cache::forget('profile:follower_count:'.$id);
+        Cache::forget('profile:follower_count:'.$pid);
+        Cache::forget('profile:following_count:'.$id);
+        Cache::forget('profile:following_count:'.$pid);
+        AccountService::del($pid);
+        AccountService::del($id);
+
+        $res = RelationshipService::get($id, $pid);
+
+        return $this->json($res);
+    }
+
+    /**
+     *  GET /api/v1/statuses/{id}/pin
+     */
+    public function statusPin(Request $request, $id)
+    {
+        abort_if(! $request->user(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+        $user = $request->user();
+        $status = Status::whereScope('public')->find($id);
+
+        if (! $status) {
+            return $this->json(['error' => 'Record not found'], 404);
+        }
+
+        if ($status->profile_id != $user->profile_id) {
+            return $this->json(['error' => "Validation failed: Someone else's post cannot be pinned"], 422);
+        }
+
+        $res = StatusService::markPin($status->id);
+
+        if (! $res['success']) {
+            return $this->json([
+                'error' => $res['error'],
+            ], 422);
+        }
+
+        $statusRes = StatusService::get($status->id, true, true);
+        $status['pinned'] = true;
+
+        return $this->json($statusRes);
+    }
+
+    /**
+     *  GET /api/v1/statuses/{id}/unpin
+     */
+    public function statusUnpin(Request $request, $id)
+    {
+        abort_if(! $request->user(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+        $status = Status::whereScope('public')->findOrFail($id);
+        $user = $request->user();
+
+        if ($status->profile_id != $user->profile_id) {
+            return $this->json(['error' => 'Record not found'], 404);
+        }
+
+        $res = StatusService::unmarkPin($status->id);
+        if (! $res) {
+            return $this->json($res, 422);
+        }
+
+        $status = StatusService::get($status->id, true, true);
+        $status['pinned'] = false;
+
+        return $this->json($status);
+    }
+}

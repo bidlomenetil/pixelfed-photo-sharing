@@ -1,0 +1,99 @@
+<?php
+
+namespace App\Transformer\Api;
+
+use App\Models\DmMessage;
+use App\Models\MediaTag;
+use App\Models\ModLog;
+use App\Models\Notification;
+use App\Models\Status;
+use App\Services\AccountService;
+use App\Services\RelationshipService;
+use App\Services\StatusService;
+use League\Fractal;
+
+class NotificationTransformer extends Fractal\TransformerAbstract
+{
+    public function transform(Notification $notification): array
+    {
+        $res = [
+            'id' => (string) $notification->id,
+            'type' => $this->replaceTypeVerb($notification->action),
+            'created_at' => (string) str_replace('+00:00', 'Z', $notification->created_at->format(DATE_RFC3339_EXTENDED)),
+        ];
+
+        $n = $notification;
+
+        if ($n->actor_id) {
+            $res['account'] = AccountService::get($n->actor_id);
+            if ($n->profile_id != $n->actor_id) {
+                $res['relationship'] = RelationshipService::get($n->actor_id, $n->profile_id);
+            }
+        }
+
+        if ($n->item_id && in_array($n->item_type, ['App\Status', Status::class])) {
+            $res['status'] = StatusService::get($n->item_id, false);
+        }
+
+        // Lets a client open the right conversation from the notification
+        if ($n->item_id && $n->item_type == DmMessage::class) {
+            $message = DmMessage::find($n->item_id);
+            if ($message) {
+                $res['direct'] = [
+                    'conversation_id' => (string) $message->conversation_id,
+                    'message_id' => (string) $message->id,
+                ];
+            }
+        }
+
+        if ($n->item_id && $n->item_type == ModLog::class) {
+            $ml = $n->item;
+            if ($ml && $ml->object_uid) {
+                $res['modlog'] = [
+                    'id' => $ml->object_uid,
+                    'url' => url('/i/admin/users/modlogs/'.$ml->object_uid),
+                ];
+            }
+        }
+
+        if ($n->item_id && in_array($n->item_type, ['App\MediaTag', MediaTag::class])) {
+            $ml = $n->item;
+            if ($ml && $ml->tagged_username) {
+                $np = StatusService::get($ml->status_id, false);
+                if ($np && isset($np['id'])) {
+                    $res['tagged'] = [
+                        'username' => $ml->tagged_username,
+                        'post_url' => $np['url'],
+                        'status_id' => $ml->status_id,
+                        'profile_id' => $ml->profile_id,
+                    ];
+                }
+            }
+        }
+
+        return $res;
+    }
+
+    public function replaceTypeVerb($verb)
+    {
+        $verbs = [
+            'dm' => 'direct',
+            'follow' => 'follow',
+            'mention' => 'mention',
+            'reblog' => 'share',
+            'share' => 'share',
+            'like' => 'favourite',
+            'comment' => 'comment',
+            'admin.user.modlog.comment' => 'modlog',
+            'tagged' => 'tagged',
+            'story:react' => 'story:react',
+            'story:comment' => 'story:comment',
+        ];
+
+        if (! isset($verbs[$verb])) {
+            return $verb;
+        }
+
+        return $verbs[$verb];
+    }
+}

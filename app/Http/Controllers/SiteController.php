@@ -1,0 +1,209 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Http\Controllers\Concerns\ManagesCachedPages;
+use App\Models\Page;
+use App\Models\Profile;
+use App\Models\User;
+use App\Services\FollowerService;
+use App\Services\StatusService;
+use App\Util\ActivityPub\Helpers;
+use App\Util\Localization\Localization;
+use Illuminate\Contracts\View\View;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
+
+class SiteController extends Controller
+{
+    use ManagesCachedPages;
+
+    public function home(Request $request)
+    {
+        if ($request->user() !== null) {
+            return $this->homeTimeline($request);
+        }
+
+        return $this->homeGuest();
+    }
+
+    public function homeGuest(): View
+    {
+        return view('site.index');
+    }
+
+    public function homeTimeline(Request $request): RedirectResponse|View
+    {
+        if ($request->has('force_old_ui')) {
+            return view('timeline.home', ['layout' => 'feed']);
+        }
+
+        return redirect('/i/web');
+    }
+
+    public function changeLocale(Request $request, $locale): RedirectResponse
+    {
+        $locale = Localization::normalizeLocale($locale);
+        $locales = Localization::languages();
+        if (in_array($locale, $locales)) {
+            if ($request->user()) {
+                $user = $request->user();
+                $user->language = $locale;
+                $user->save();
+            }
+            session()->put('locale', $locale);
+        }
+
+        return redirect(route('site.language'));
+    }
+
+    public function about()
+    {
+        // Scope the cache key by locale: the rendered view contains many
+        // translated site.* strings, so a single shared key would let one
+        // locale's render be served to visitors of other locales.
+        $cacheKey = 'site.about_v2:'.app()->getLocale();
+
+        return Cache::remember($cacheKey, now()->addMinutes(15), function () {
+            $user_count = number_format(User::count());
+            $post_count = number_format(StatusService::totalLocalStatuses());
+            $rules = config_cache('app.rules') ? json_decode(config_cache('app.rules'), true) : null;
+
+            return view('site.about', ['rules' => $rules, 'user_count' => $user_count, 'post_count' => $post_count])->render();
+        });
+    }
+
+    public function language(): View
+    {
+        return view('site.language');
+    }
+
+    public function communityGuidelines(Request $request)
+    {
+        // Cache only the page payload and render the view per request, so the
+        // layout/footer (config version/domain, canonical url, csrf token) is
+        // evaluated on every request rather than baked into a cached HTML blob.
+        Cache::remember('site:help:community-guidelines', now()->addDays(120), function () {
+            return $this->cachedPage('/site/kb/community-guidelines');
+        });
+
+        $page = Page::whereSlug('/site/kb/community-guidelines')->whereActive(true)->first();
+
+        return view('site.help.community-guidelines', ['page' => $page])->render();
+    }
+
+    public function privacy(Request $request)
+    {
+        $page = Cache::remember('site:privacy', now()->addDays(120), function () {
+            return $this->cachedPage('/site/privacy');
+        });
+
+        return view('site.privacy', ['page' => $page])->render();
+    }
+
+    public function terms(Request $request)
+    {
+        $page = Cache::remember('site:terms', now()->addDays(120), function () {
+            return $this->cachedPage('/site/terms');
+        });
+
+        return view('site.terms', ['page' => $page])->render();
+    }
+
+    public function redirectUrl(Request $request): View
+    {
+        abort_if(! $request->user(), 404);
+        $this->validate($request, [
+            'url' => 'required|url',
+        ]);
+        $url = request()->input('url');
+        abort_if(Helpers::validateUrl($url) == false, 404);
+
+        return view('site.redirect', ['url' => $url]);
+    }
+
+    public function followIntent(Request $request): View
+    {
+        $this->validate($request, [
+            'user' => 'string|min:1|max:30|exists:users,username',
+        ]);
+        $profile = Profile::whereUsername($request->input('user'))->firstOrFail();
+        $user = $request->user();
+        abort_if($user && $profile->id == $user->profile_id, 404);
+        $following = $user != null ? FollowerService::follows($user->profile_id, $profile->id) : false;
+
+        return view('site.intents.follow', ['profile' => $profile, 'user' => $user, 'following' => $following]);
+    }
+
+    public function legacyProfileRedirect(Request $request, $username): RedirectResponse
+    {
+        $username = Str::contains($username, '@') ? '@'.$username : $username;
+        if (str_contains($username, '@')) {
+            $profile = Profile::whereUsername($username)
+                ->firstOrFail();
+
+            if ($profile->domain == null) {
+                $url = "/$profile->username";
+            } else {
+                $url = "/i/web/profile/_/{$profile->id}";
+            }
+
+        } else {
+            $profile = Profile::whereUsername($username)
+                ->whereNull('domain')
+                ->firstOrFail();
+            $url = "/$profile->username";
+        }
+
+        return redirect($url);
+    }
+
+    public function legacyWebfingerRedirect(Request $request, $username, $domain): RedirectResponse
+    {
+        $un = '@'.$username.'@'.$domain;
+        $profile = Profile::whereUsername($un)
+            ->firstOrFail();
+
+        if ($profile->domain == null) {
+            $url = "/$profile->username";
+        } else {
+            $url = $request->user() ? "/i/web/profile/_/{$profile->id}" : $profile->url();
+        }
+
+        return redirect($url);
+    }
+
+    public function legalNotice(Request $request)
+    {
+        $page = Cache::remember('site:legal-notice', now()->addDays(120), function () {
+            return $this->cachedPage('/site/legal-notice');
+        });
+        abort_if(! $page, 404);
+
+        return view('site.legal-notice', ['page' => $page])->render();
+    }
+
+    public function curatedOnboarding(Request $request): RedirectResponse|View
+    {
+        if ($request->user()) {
+            return redirect('/i/web');
+        }
+
+        $regOpen = (bool) config_cache('pixelfed.open_registration');
+        $curOnboarding = (bool) config_cache('instance.curated_registration.enabled');
+        $curOnlyClosed = (bool) config('instance.curated_registration.state.only_enabled_on_closed_reg');
+        if ($regOpen) {
+            if ($curOnlyClosed) {
+                return redirect('/register');
+            }
+        } else {
+            if (! $curOnboarding) {
+                return redirect('/');
+            }
+        }
+
+        return view('auth.curated-register.index', ['step' => 1]);
+    }
+}

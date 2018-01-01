@@ -1,0 +1,330 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Jobs\StoryPipeline\StoryViewDeliver;
+use App\Models\Profile;
+use App\Models\Story;
+use App\Models\StoryView;
+use App\Services\AccountService;
+use App\Services\FollowerService;
+use App\Services\PollService;
+use App\Services\StoryService;
+use App\Services\StoryViewService;
+use App\Services\UserRoleService;
+use App\Transformer\ActivityPub\Verb\StoryVerb;
+use Illuminate\Contracts\View\View;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Storage;
+use League\Fractal\Manager;
+use League\Fractal\Resource\Item;
+use League\Fractal\Serializer\ArraySerializer;
+
+class StoryController extends StoryComposeController
+{
+    public function recent(Request $request)
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+        $user = $request->user();
+        if ($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id)) {
+            return [];
+        }
+        $pid = $user->profile_id;
+
+        // One row per followed author: the author's newest active story
+        // (MAX(id), matching StoryService::latest()). Collapsing in SQL via a
+        // correlated MAX(id) is deterministic and portable across
+        // mysql/mariadb/pgsql/sqlite — the previous groupBy(stories.*) and
+        // unique() without ordering both left the kept row unspecified.
+        $s = Cache::remember('pf:stories:recent-by-id:'.$pid, 900, function () use ($pid) {
+            return Story::select('stories.*')
+                ->join('followers', 'followers.following_id', 'stories.profile_id')
+                ->join('profiles', 'profiles.id', 'stories.profile_id')
+                ->where('followers.profile_id', $pid)
+                ->whereNull('profiles.status')
+                ->where('stories.active', true)
+                ->whereRaw('stories.id = (
+                    select max(s2.id)
+                    from stories as s2
+                    where s2.profile_id = stories.profile_id
+                      and s2.active = ?
+                )', [true])
+                ->orderByDesc('stories.id')
+                ->get();
+        });
+
+        $self = Cache::remember('pf:stories:recent-self:'.$pid, 21600, function () use ($pid) {
+            return Story::whereProfileId($pid)
+                ->whereActive(true)
+                ->orderByDesc('id')
+                ->limit(1)
+                ->get()
+                ->map(function ($s) use ($pid) {
+                    $r = new \StdClass;
+                    $r->id = $s->id;
+                    $r->profile_id = $pid;
+                    $r->type = $s->type;
+                    $r->path = $s->path;
+
+                    return $r;
+                });
+        });
+
+        if ($self->count()) {
+            $s->prepend($self->first());
+        }
+
+        $res = $s->map(function ($s) use ($pid) {
+            $profile = AccountService::get($s->profile_id);
+            $url = $profile['local'] ? url("/stories/{$profile['username']}") :
+                url("/i/rs/{$profile['id']}");
+
+            // Fall back to the current story id if latest() is null (cache may
+            // have been invalidated for a just-expired author).
+            $latest = StoryService::latest($s->profile_id) ?? $s->id;
+
+            return [
+                'pid' => $profile['id'],
+                'avatar' => $profile['avatar'],
+                'local' => $profile['local'],
+                'username' => $profile['acct'],
+                'latest' => [
+                    'id' => $s->id,
+                    'type' => $s->type,
+                    'preview_url' => url(Storage::url($s->path)),
+                ],
+                'url' => $url,
+                'seen' => StoryService::hasSeen($pid, $latest),
+                'sid' => $s->id,
+            ];
+        })
+            ->sortBy('seen')
+            ->values();
+
+        return response()->json($res, 200, [], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    }
+
+    public function profile(Request $request, $id)
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+
+        $user = $request->user();
+        if ($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id)) {
+            return [];
+        }
+        $authed = $user->profile_id;
+        $profile = Profile::findOrFail($id);
+
+        // Suspended/deleted profiles are unavailable to everyone, including the
+        // account itself, matching the status gate on posts and other content.
+        abort_if($profile->status !== null, 404);
+
+        if ($authed != $profile->id && ! FollowerService::follows($authed, $profile->id)) {
+            abort(403);
+        }
+
+        $stories = Story::whereProfileId($profile->id)
+            ->whereActive(true)
+            ->orderBy('expires_at')
+            ->get()
+            ->map(function ($s, $k) use ($authed) {
+                $seen = StoryService::hasSeen($authed, $s->id);
+                $res = [
+                    'id' => (string) $s->id,
+                    'type' => $s->type,
+                    'duration' => $s->duration,
+                    'src' => url(Storage::url($s->path)),
+                    'created_at' => $s->created_at->toAtomString(),
+                    'expires_at' => $s->expires_at->toAtomString(),
+                    'view_count' => ($authed == $s->profile_id) ? ($s->view_count ?? 0) : null,
+                    'seen' => $seen,
+                    'progress' => $seen ? 100 : 0,
+                    'can_reply' => (bool) $s->can_reply,
+                    'can_react' => (bool) $s->can_react,
+                ];
+
+                if ($s->type == 'poll') {
+                    $res['question'] = json_decode($s->story, true)['question'];
+                    $res['options'] = json_decode($s->story, true)['options'];
+                    $res['voted'] = PollService::votedStory($s->id, $authed);
+                    if ($res['voted']) {
+                        $res['voted_index'] = PollService::storyChoice($s->id, $authed);
+                    }
+                }
+
+                return $res;
+            })->toArray();
+        if (count($stories) === 0) {
+            return [];
+        }
+        $cursor = count($stories) - 1;
+        $stories = [[
+            'id' => (string) $stories[$cursor]['id'],
+            'nodes' => $stories,
+            'account' => AccountService::get($profile->id),
+            'pid' => (string) $profile->id,
+        ]];
+
+        return response()->json($stories, 200, [], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    }
+
+    public function viewed(Request $request): array
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+
+        $this->validate($request, [
+            'id' => 'required|min:1',
+        ]);
+        $id = $request->input('id');
+        $user = $request->user();
+        if ($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id)) {
+            return [];
+        }
+        $authed = $user->profile;
+
+        $story = Story::with('profile')
+            ->whereActive(true)
+            ->findOrFail($id);
+        $exp = $story->expires_at;
+
+        $profile = $story->profile;
+
+        if ($story->profile_id == $authed->id) {
+            return [];
+        }
+
+        $publicOnly = (bool) $profile->followedBy($authed);
+        abort_if(! $publicOnly, 403);
+
+        $recorded = app(StoryViewService::class)->record($story, (int) $authed->id);
+
+        if ($recorded && $story->local == false) {
+            StoryViewDeliver::dispatch($story, $authed)->onQueue('story');
+        }
+
+        Cache::forget('pf:stories:recent-by-id:'.$authed->id);
+
+        return ['code' => 200];
+    }
+
+    public function exists(Request $request, $id): JsonResponse
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+        $user = $request->user();
+        if ($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id)) {
+            return response()->json(false);
+        }
+
+        return response()->json(Story::whereProfileId($id)
+            ->whereActive(true)
+            ->exists());
+    }
+
+    public function iRedirect(Request $request): RedirectResponse
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+
+        $user = $request->user();
+        abort_if(! $user, 404);
+        $username = $user->username;
+
+        return redirect("/stories/{$username}");
+    }
+
+    public function viewers(Request $request): JsonResponse
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+
+        $this->validate($request, [
+            'sid' => 'required|string',
+        ]);
+
+        $user = $request->user();
+        if ($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id)) {
+            return response()->json([]);
+        }
+
+        $pid = $request->user()->profile_id;
+        $sid = $request->input('sid');
+
+        $story = Story::whereProfileId($pid)
+            ->whereActive(true)
+            ->findOrFail($sid);
+
+        $viewers = StoryView::whereStoryId($story->id)
+            ->latest()
+            ->simplePaginate(10)
+            ->map(function ($view) {
+                return AccountService::get($view->profile_id);
+            })
+            ->values();
+
+        return response()->json($viewers, 200, [], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    }
+
+    public function remoteStory(Request $request, $id): RedirectResponse|View
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+
+        $profile = Profile::findOrFail($id);
+        if ($profile->user_id != null || $profile->domain == null) {
+            return redirect('/stories/'.$profile->username);
+        }
+        $pid = $profile->id;
+
+        return view('stories.show_remote', ['pid' => $pid]);
+    }
+
+    public function pollResults(Request $request)
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled') || ! $request->user(), 404);
+
+        $this->validate($request, [
+            'sid' => 'required|string',
+        ]);
+
+        $pid = $request->user()->profile_id;
+        $sid = $request->input('sid');
+
+        $story = Story::whereProfileId($pid)
+            ->whereActive(true)
+            ->findOrFail($sid);
+
+        return PollService::storyResults($sid);
+    }
+
+    public function getActivityObject(Request $request, $username, $id): JsonResponse|RedirectResponse
+    {
+        abort_if(! (bool) config_cache('instance.stories.enabled'), 404);
+
+        if (! $request->wantsJson()) {
+            return redirect('/stories/'.$username);
+        }
+
+        abort_if(! $request->hasHeader('Authorization'), 404);
+
+        $profile = Profile::whereUsername($username)->whereNull('domain')->firstOrFail();
+        $story = Story::whereActive(true)->whereProfileId($profile->id)->findOrFail($id);
+
+        abort_if($story->bearcap_token == null, 404);
+        abort_if(now()->gt($story->expires_at), 404);
+        $token = substr($request->header('Authorization'), 7);
+        abort_if(hash_equals($story->bearcap_token, $token) === false, 404);
+        abort_if($story->created_at->lt(now()->subMinutes(20)), 404);
+
+        $fractal = new Manager;
+        $fractal->setSerializer(new ArraySerializer);
+        $resource = new Item($story, new StoryVerb);
+        $res = $fractal->createData($resource)->toArray();
+
+        return response()->json($res, 200, [], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    }
+
+    public function showSystemStory(): void
+    {
+        // return view('stories.system');
+    }
+}

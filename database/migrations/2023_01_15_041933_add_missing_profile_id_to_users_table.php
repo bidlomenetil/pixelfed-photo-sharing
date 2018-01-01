@@ -1,0 +1,34 @@
+<?php
+
+use App\Models\Profile;
+use App\Models\User;
+use Illuminate\Database\Migrations\Migration;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     *
+     * @return void
+     */
+    public function up()
+    {
+        User::whereNull('profile_id')
+            ->chunk(20, function ($users) {
+                foreach ($users as $user) {
+                    $profile = Profile::whereUsername($user->username)->first();
+                    if ($profile) {
+                        $user->profile_id = $profile->id;
+                        $user->save();
+                    }
+                }
+            });
+    }
+
+    /**
+     * Reverse the migrations.
+     *
+     * @return void
+     */
+    public function down() {}
+};

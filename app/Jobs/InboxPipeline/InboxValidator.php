@@ -1,0 +1,198 @@
+<?php
+
+namespace App\Jobs\InboxPipeline;
+
+use App\Jobs\InboxPipeline\Concerns\MatchesActorUrl;
+use App\Jobs\InboxPipeline\Concerns\RetriesWhenActorUnavailable;
+use App\Models\Profile;
+use App\Services\BlockSyncService;
+use App\Services\FollowersSyncService;
+use App\Util\ActivityPub\Helpers;
+use App\Util\ActivityPub\HttpSignature;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Lottery;
+
+class InboxValidator implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use MatchesActorUrl;
+    use RetriesWhenActorUnavailable;
+
+    protected $username;
+
+    protected $headers;
+
+    protected $payload;
+
+    public $timeout = 300;
+
+    // One attempt plus the retries in RetriesWhenActorUnavailable. Exceptions
+    // still fail the job immediately because of $maxExceptions below.
+    public $tries = 4;
+
+    public $maxExceptions = 1;
+
+    /**
+     * Create a new job instance.
+     *
+     * @return void
+     */
+    public function __construct($username, $headers, $payload)
+    {
+        $this->username = $username;
+        $this->headers = $headers;
+        $this->payload = $payload;
+    }
+
+    /**
+     * Execute the job.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $username = $this->username;
+        $headers = $this->headers;
+
+        if (empty($headers) || empty($this->payload) || ! isset($headers['signature']) || ! isset($headers['date'])) {
+            return;
+        }
+
+        $payload = json_decode($this->payload, true, 8);
+
+        $profile = Profile::whereNull('domain')->whereUsername($username)->first();
+
+        if (empty($profile) || empty($headers) || empty($payload)) {
+            return;
+        }
+
+        if ($profile->status != null) {
+            return;
+        }
+
+        if ($this->verifySignature($headers, $profile, $payload) == true) {
+            if (isset($payload['id'])) {
+                $lockKey = 'pf:ap:user-inbox:activity:'.hash('sha256', $payload['id']);
+                if (! Cache::add($lockKey, 1, 3600)) {
+                    // Already processed after valid signature check
+                    return;
+                }
+            }
+
+            // FEP-8fcf: compare the sender's followers digest with our copy
+            FollowersSyncService::handleInboundHeaders($headers);
+
+            // FEP-070c: compare the sender's block digest with our copy
+            BlockSyncService::handleInboundHeaders($headers);
+
+            if (isset($payload['type']) && in_array($payload['type'], ['Follow', 'Accept'])) {
+                ActivityHandler::dispatch($headers, $profile, $payload)->onQueue('follow');
+            } else {
+                $onQueue = Lottery::odds(1, 12)->winner(fn (): string => 'high')->loser(fn (): string => 'inbox')->choose();
+                ActivityHandler::dispatch($headers, $profile, $payload)->onQueue($onQueue);
+            }
+
+            return;
+        }
+
+        $this->retryLaterIfActorUnavailable();
+    }
+
+    protected function verifySignature($headers, $profile, $payload)
+    {
+        $body = $this->payload;
+        $bodyDecoded = $payload;
+        $signature = is_array($headers['signature']) ? $headers['signature'][0] : $headers['signature'];
+        $date = is_array($headers['date']) ? $headers['date'][0] : $headers['date'];
+        if (! $signature) {
+            return false;
+        }
+        if (! $date) {
+            return false;
+        }
+        if (
+            ! now()->parse($date)->gt(now()->subDays(1)) ||
+            ! now()->parse($date)->lt(now()->addDays(1))
+        ) {
+            return false;
+        }
+        if (! isset($bodyDecoded['id'])) {
+            return false;
+        }
+        $signatureData = HttpSignature::parseSignatureHeader($signature);
+
+        if (! isset($signatureData['keyId'], $signatureData['signature'], $signatureData['headers']) || isset($signatureData['error'])) {
+            return false;
+        }
+
+        $keyId = Helpers::validateUrl($signatureData['keyId']);
+        $id = Helpers::validateUrl($bodyDecoded['id']);
+        $keyDomain = parse_url($keyId, PHP_URL_HOST);
+        $idDomain = parse_url($id, PHP_URL_HOST);
+        $claimedActor = Helpers::pluckval($bodyDecoded['actor'] ?? null);
+        if (is_array($claimedActor)) {
+            $claimedActor = $claimedActor['id'] ?? null;
+        }
+        if (! $claimedActor && self::actorOptionalFor($bodyDecoded)) {
+            $claimedActor = $keyId ? strtok($keyId, '#') : null;
+        }
+        $actorDomain = parse_url((string) $claimedActor, PHP_URL_HOST);
+        if (
+            isset($bodyDecoded['object'])
+            && is_array($bodyDecoded['object'])
+            && isset($bodyDecoded['object']['attributedTo'])
+        ) {
+            $attr = Helpers::pluckval($bodyDecoded['object']['attributedTo']);
+            if (is_array($attr)) {
+                if (isset($attr['id'])) {
+                    $attr = $attr['id'];
+                } else {
+                    $attr = '';
+                }
+            }
+            if (parse_url($attr, PHP_URL_HOST) !== $keyDomain) {
+                return false;
+            }
+        }
+        if (
+            ! $keyDomain || ! $idDomain || ! $actorDomain
+            || $keyDomain !== $idDomain || $keyDomain !== $actorDomain
+        ) {
+            return false;
+        }
+        $actor = Profile::whereKeyId($keyId)->first();
+        if (! $actor) {
+            $actor = Helpers::profileFirstOrNew($claimedActor);
+        }
+        if (! $actor) {
+            $this->markActorUnavailable($claimedActor);
+
+            return false;
+        }
+        // The key owner MUST be the actor the activity claims to be from.
+        // A same-host check is not enough: every account on a multi-user
+        // instance shares $keyDomain, so one account could sign on behalf of
+        // another on the same host. An exact actor-URL match closes that gap.
+        if (! self::sameActorUrl($actor->remote_url, $claimedActor)) {
+            return false;
+        }
+        $pkey = openssl_pkey_get_public($actor->public_key);
+        if (! $pkey) {
+            return false;
+        }
+        $inboxPath = "/users/{$profile->username}/inbox";
+        [$verified, $headers] = HttpSignature::verify($pkey, $signatureData, $headers, $inboxPath, $body);
+
+        return $verified == 1;
+    }
+
+    public static function actorOptionalFor(array $payload): bool
+    {
+        return isset($payload['type']) && $payload['type'] === 'FeatureRequest';
+    }
+}

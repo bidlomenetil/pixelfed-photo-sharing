@@ -1,0 +1,155 @@
+<?php
+
+namespace App\Jobs\AvatarPipeline;
+
+use App\Models\Avatar;
+use App\Models\Profile;
+use App\Util\Media\ImageDriverManager;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Intervention\Image\Encoders\AvifEncoder;
+use Intervention\Image\Encoders\JpegEncoder;
+use Intervention\Image\Encoders\PngEncoder;
+use Intervention\Image\Encoders\WebpEncoder;
+
+class AvatarOptimize implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $profile;
+
+    protected $current;
+
+    /**
+     * Delete the job if its models no longer exist.
+     *
+     * @var bool
+     */
+    public $deleteWhenMissingModels = true;
+
+    /**
+     * Create a new job instance.
+     *
+     * @return void
+     */
+    public function __construct(Profile $profile, $current)
+    {
+        $this->profile = $profile;
+        $this->current = $current;
+    }
+
+    /**
+     * Execute the job.
+     *
+     * @return void
+     */
+    public function handle()
+    {
+        $avatar = $this->profile->avatar;
+        $file = storage_path("app/$avatar->media_path");
+        $fileInfo = pathinfo($file);
+        $extension = strtolower($fileInfo['extension'] ?? 'jpg');
+
+        $imageManager = ImageDriverManager::createImageManager();
+
+        $quality = config_cache('pixelfed.image_quality');
+
+        $encoder = null;
+        switch ($extension) {
+            case 'jpeg':
+            case 'jpg':
+                $encoder = new JpegEncoder($quality);
+                break;
+            case 'png':
+                $encoder = new PngEncoder;
+                break;
+            case 'webp':
+                $encoder = new WebpEncoder($quality);
+                break;
+            case 'avif':
+                $encoder = new AvifEncoder($quality);
+                break;
+            case 'heic':
+                $encoder = new JpegEncoder($quality);
+                $extension = 'jpg';
+                break;
+            default:
+                $encoder = new JpegEncoder($quality);
+                $extension = 'jpg';
+        }
+
+        try {
+            $img = $imageManager->decodePath($file);
+            $img = $img->coverDown(200, 200);
+            $encoded = $encoder->encode($img);
+            file_put_contents($file, $encoded->toString());
+
+            $avatar = Avatar::whereProfileId($this->profile->id)->firstOrFail();
+            $avatar->change_count = ++$avatar->change_count;
+            $avatar->last_processed_at = now();
+            $avatar->save();
+            Cache::forget('avatar:'.$avatar->profile_id);
+            $this->deleteOldAvatar($avatar->media_path, $this->current);
+
+            if ((bool) config_cache('pixelfed.cloud_storage')) {
+                $this->uploadToCloud($avatar);
+            } else {
+                $avatar->cdn_url = null;
+                $avatar->save();
+            }
+        } catch (\Exception $e) {
+            Log::error('AvatarOptimize failed for profile '.$this->profile->id.': '.$e->getMessage());
+
+            // The encode/upload may have failed before the old avatar file was
+            // removed. $this->current is the previous avatar's absolute path;
+            // clean it (and its now-stale directory) up so failures don't leak.
+            $this->deleteOldAvatar('', $this->current);
+        }
+    }
+
+    protected function deleteOldAvatar($new, $current)
+    {
+        if (! $current) {
+            return;
+        }
+
+        if (storage_path('app/'.$new) == $current ||
+             Str::endsWith($current, 'avatars/default.png') ||
+             Str::endsWith($current, 'avatars/default.jpg')) {
+            return;
+        }
+        if (is_file($current)) {
+            @unlink($current);
+        }
+    }
+
+    protected function uploadToCloud($avatar)
+    {
+        $base = 'cache/avatars/'.$avatar->profile_id;
+        $disk = Storage::disk(config('filesystems.cloud'));
+        $local = $avatar->media_path;
+        $path = $base.'/'.'avatar_'.strtolower(Str::random(random_int(3, 6))).$avatar->change_count.'.'.pathinfo($local, PATHINFO_EXTENSION);
+
+        $disk->put($path, Storage::get($local));
+
+        $avatar->media_path = $path;
+        $avatar->cdn_url = $disk->url($path);
+        $avatar->save();
+
+        foreach ($disk->files($base) as $old) {
+            if ($old !== $path) {
+                $disk->delete($old);
+            }
+        }
+
+        Storage::delete($local);
+        Cache::forget('avatar:'.$avatar->profile_id);
+    }
+}

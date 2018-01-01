@@ -1,0 +1,1098 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Http\Resources\AdminInstance;
+use App\Http\Resources\AdminProfile;
+use App\Http\Resources\AdminUser;
+use App\Jobs\DeletePipeline\DeleteAccountPipeline;
+use App\Jobs\DeletePipeline\DeleteRemoteProfilePipeline;
+use App\Jobs\StatusPipeline\StatusDelete;
+use App\Models\AccountInterstitial;
+use App\Models\Conversation;
+use App\Models\Instance;
+use App\Models\Notification;
+use App\Models\Profile;
+use App\Models\RemoteReport;
+use App\Models\Report;
+use App\Models\Status;
+use App\Models\User;
+use App\Services\Account\AccountStatService;
+use App\Services\AccountService;
+use App\Services\AdminStatsService;
+use App\Services\ConfigCacheService;
+use App\Services\InstanceService;
+use App\Services\ModLogService;
+use App\Services\NetworkTimelineService;
+use App\Services\NotificationService;
+use App\Services\PublicTimelineService;
+use App\Services\SnowflakeService;
+use App\Services\StatusService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+
+class AdminApiController extends Controller
+{
+    public function supported(Request $request): JsonResponse
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        return response()->json(['supported' => true]);
+    }
+
+    public function getStats(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $res = AdminStatsService::summary();
+        $res['autospam_count'] = AccountInterstitial::whereType('post.autospam')
+            ->whereNull('appeal_handled_at')
+            ->count();
+
+        return $res;
+    }
+
+    public function autospam(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $appeals = AccountInterstitial::whereType('post.autospam')
+            ->whereNull('appeal_handled_at')
+            ->latest()
+            ->simplePaginate(6)
+            ->map(function ($report) {
+                $r = [
+                    'id' => $report->id,
+                    'type' => $report->type,
+                    'item_id' => $report->item_id,
+                    'item_type' => $report->item_type,
+                    'created_at' => $report->created_at,
+                ];
+                if ($report->item_type === Status::class) {
+                    $status = StatusService::get($report->item_id, false);
+                    if (! $status) {
+                        return;
+                    }
+
+                    $r['status'] = $status;
+
+                    if ($status['in_reply_to_id']) {
+                        $r['parent'] = StatusService::get($status['in_reply_to_id'], false);
+                    }
+                }
+
+                return $r;
+            });
+
+        return $appeals;
+    }
+
+    /**
+     * @return 'success'[]
+     */
+    public function autospamHandle(Request $request): array
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'action' => 'required|in:dismiss,approve,dismiss-all,approve-all,delete-post,delete-account',
+            'id' => 'required',
+        ]);
+
+        $action = $request->input('action');
+        $id = $request->input('id');
+        $appeal = AccountInterstitial::whereType('post.autospam')
+            ->whereNull('appeal_handled_at')
+            ->findOrFail($id);
+        $now = now();
+        $res = ['status' => 'success'];
+        $meta = json_decode($appeal->meta);
+        $user = $appeal->user;
+        $profile = $user->profile;
+
+        if ($action == 'dismiss') {
+            $appeal->is_spam = true;
+            $appeal->appeal_handled_at = $now;
+            $appeal->save();
+
+            Cache::forget('pf:bouncer_v0:exemption_by_pid:'.$profile->id);
+            Cache::forget('pf:bouncer_v0:recent_by_pid:'.$profile->id);
+            Cache::forget('admin-dash:reports:spam-count');
+
+            return $res;
+        }
+
+        if ($action == 'delete-post') {
+            $appeal->appeal_handled_at = now();
+            $appeal->is_spam = true;
+            $appeal->save();
+            ModLogService::boot()
+                ->objectUid($profile->id)
+                ->objectId($appeal->status->id)
+                ->objectType('App\Status::class')
+                ->user($request->user())
+                ->action('admin.status.delete')
+                ->accessLevel('admin')
+                ->save();
+            PublicTimelineService::deleteByProfileId($profile->id);
+            StatusDelete::dispatch($appeal->status)->onQueue('high');
+            Cache::forget('admin-dash:reports:spam-count');
+
+            return $res;
+        }
+
+        if ($action == 'delete-account') {
+            abort_if($user->is_admin, 400, 'Cannot delete an admin account.');
+            $appeal->appeal_handled_at = now();
+            $appeal->is_spam = true;
+            $appeal->save();
+            ModLogService::boot()
+                ->objectUid($profile->id)
+                ->objectId($profile->id)
+                ->objectType('App\User::class')
+                ->user($request->user())
+                ->action('admin.user.delete')
+                ->accessLevel('admin')
+                ->save();
+            PublicTimelineService::deleteByProfileId($profile->id);
+            DeleteAccountPipeline::dispatch($appeal->user)->onQueue('high');
+            Cache::forget('admin-dash:reports:spam-count');
+
+            return $res;
+        }
+
+        if ($action == 'dismiss-all') {
+            AccountInterstitial::whereType('post.autospam')
+                ->whereItemType(Status::class)
+                ->whereNull('appeal_handled_at')
+                ->whereUserId($appeal->user_id)
+                ->update(['appeal_handled_at' => $now, 'is_spam' => true]);
+            Cache::forget('pf:bouncer_v0:exemption_by_pid:'.$appeal->user->profile_id);
+            Cache::forget('pf:bouncer_v0:recent_by_pid:'.$appeal->user->profile_id);
+            Cache::forget('admin-dash:reports:spam-count');
+
+            return $res;
+        }
+
+        if ($action == 'approve') {
+            $status = $appeal->status;
+            $status->is_nsfw = $meta->is_nsfw;
+            $status->scope = 'public';
+            $status->visibility = 'public';
+            $status->save();
+
+            $appeal->is_spam = false;
+            $appeal->appeal_handled_at = now();
+            $appeal->save();
+
+            StatusService::del($status->id);
+
+            Notification::whereAction('autospam.warning')
+                ->whereProfileId($appeal->user->profile_id)
+                ->get()
+                ->each(function ($n) use ($appeal) {
+                    NotificationService::del($appeal->user->profile_id, $n->id);
+                    $n->forceDelete();
+                });
+
+            Cache::forget('pf:bouncer_v0:exemption_by_pid:'.$appeal->user->profile_id);
+            Cache::forget('pf:bouncer_v0:recent_by_pid:'.$appeal->user->profile_id);
+            Cache::forget('admin-dash:reports:spam-count');
+
+            return $res;
+        }
+
+        if ($action == 'approve-all') {
+            AccountInterstitial::whereType('post.autospam')
+                ->whereItemType(Status::class)
+                ->whereNull('appeal_handled_at')
+                ->whereUserId($appeal->user_id)
+                ->get()
+                ->each(function ($report) {
+                    $report->is_spam = false;
+                    $report->appeal_handled_at = now();
+                    $report->save();
+                    $status = Status::find($report->item_id);
+                    if ($status) {
+                        // Restore each status from its own appeal's snapshot,
+                        // not the trigger appeal's, so mixed NSFW/SFW posts keep
+                        // their own content-warning state.
+                        $status->is_nsfw = json_decode($report->meta)->is_nsfw;
+                        $status->scope = 'public';
+                        $status->visibility = 'public';
+                        $status->save();
+                        StatusService::del($status->id, true);
+                    }
+
+                    Notification::whereAction('autospam.warning')
+                        ->whereProfileId($report->user->profile_id)
+                        ->get()
+                        ->each(function ($n) use ($report) {
+                            NotificationService::del($report->user->profile_id, $n->id);
+                            $n->forceDelete();
+                        });
+                });
+            Cache::forget('pf:bouncer_v0:exemption_by_pid:'.$appeal->user->profile_id);
+            Cache::forget('pf:bouncer_v0:recent_by_pid:'.$appeal->user->profile_id);
+            Cache::forget('admin-dash:reports:spam-count');
+
+            return $res;
+        }
+
+        return $res;
+    }
+
+    public function modReports(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $reports = Report::whereNull('admin_seen')
+            ->orderBy('created_at', 'desc')
+            ->paginate(6)
+            ->map(function ($report) {
+                $r = [
+                    'id' => $report->id,
+                    'type' => $report->type,
+                    'message' => $report->message,
+                    'object_id' => $report->object_id,
+                    'object_type' => $report->object_type,
+                    'created_at' => $report->created_at,
+                ];
+
+                if ($report->profile_id) {
+                    $r['reported_by_account'] = AccountService::get($report->profile_id, true);
+                }
+
+                if ($report->object_type === Status::class) {
+                    $status = StatusService::get($report->object_id, false);
+                    if (! $status) {
+                        return;
+                    }
+
+                    $r['status'] = $status;
+
+                    if ($status['local'] && isset($status['account']['id'])) {
+                        $r['status']['user_id'] = (string) AccountService::getUserIdFromProfileId($status['account']['id']);
+                    }
+
+                    if (isset($status['in_reply_to_id'])) {
+                        $r['parent'] = StatusService::get($status['in_reply_to_id'], false);
+                    }
+                }
+
+                if ($report->object_type === Profile::class) {
+                    $acct = AccountService::get($report->object_id, true);
+                    if ($acct && isset($acct['local'])) {
+                        $r['account'] = $acct;
+                        if ($acct['local']) {
+                            $r['account']['user_id'] = (string) AccountService::getUserIdFromProfileId($acct['id']);
+                        }
+                    }
+                }
+
+                return $r;
+            })
+            ->filter()
+            ->values();
+
+        return $reports;
+    }
+
+    public function modReportHandle(Request $request): array
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'action' => 'required|string',
+            'id' => 'required',
+        ]);
+
+        $action = $request->input('action');
+        $id = $request->input('id');
+
+        $actions = [
+            'ignore',
+            'cw',
+            'unlist',
+        ];
+
+        if (! in_array($action, $actions)) {
+            return abort(403);
+        }
+
+        $report = Report::findOrFail($id);
+        $item = $report->reported();
+        $report->admin_seen = now();
+
+        switch ($action) {
+            case 'ignore':
+                $report->not_interested = true;
+                break;
+
+            case 'cw':
+                Cache::forget('status:thumb:'.$item->id);
+                $item->is_nsfw = true;
+                $item->save();
+                $report->nsfw = true;
+                StatusService::del($item->id, true);
+                break;
+
+            case 'unlist':
+                $item->visibility = 'unlisted';
+                $item->save();
+                StatusService::del($item->id, true);
+                break;
+
+            default:
+                $report->admin_seen = null;
+                break;
+        }
+
+        $report->save();
+        Cache::forget('admin-dash:reports:list-cache');
+        Cache::forget('admin:dashboard:home:data:v0:15min');
+
+        return ['success' => true];
+    }
+
+    public function getConfiguration(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        abort_unless(config('instance.enable_cc'), 400);
+
+        return collect([
+            [
+                'name' => 'ActivityPub Federation',
+                'description' => 'Enable activitypub federation support, compatible with Pixelfed, Mastodon and other platforms.',
+                'key' => 'federation.activitypub.enabled',
+            ],
+
+            [
+                'name' => 'Open Registration',
+                'description' => 'Allow new account registrations.',
+                'key' => 'pixelfed.open_registration',
+            ],
+
+            [
+                'name' => 'Stories',
+                'description' => 'Enable the ephemeral Stories feature.',
+                'key' => 'instance.stories.enabled',
+            ],
+
+            [
+                'name' => 'Require Email Verification',
+                'description' => 'Require new accounts to verify their email address.',
+                'key' => 'pixelfed.enforce_email_verification',
+            ],
+
+            [
+                'name' => 'AutoSpam Detection',
+                'description' => 'Detect and remove spam from public timelines.',
+                'key' => 'pixelfed.bouncer.enabled',
+            ],
+        ])
+            ->map(function ($s) {
+                $s['state'] = (bool) config_cache($s['key']);
+
+                return $s;
+            });
+    }
+
+    public function updateConfiguration(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        abort_unless(config('instance.enable_cc'), 400);
+
+        $this->validate($request, [
+            'key' => 'required',
+            'value' => 'required',
+        ]);
+
+        $allowedKeys = [
+            'federation.activitypub.enabled',
+            'pixelfed.open_registration',
+            'instance.stories.enabled',
+            'pixelfed.enforce_email_verification',
+            'pixelfed.bouncer.enabled',
+        ];
+
+        $key = $request->input('key');
+        $value = (bool) filter_var($request->input('value'), FILTER_VALIDATE_BOOLEAN);
+        abort_if(! in_array($key, $allowedKeys), 400, 'Invalid cache key.');
+
+        ConfigCacheService::put($key, $value);
+
+        return collect([
+            [
+                'name' => 'ActivityPub Federation',
+                'description' => 'Enable activitypub federation support, compatible with Pixelfed, Mastodon and other platforms.',
+                'key' => 'federation.activitypub.enabled',
+            ],
+
+            [
+                'name' => 'Open Registration',
+                'description' => 'Allow new account registrations.',
+                'key' => 'pixelfed.open_registration',
+            ],
+
+            [
+                'name' => 'Stories',
+                'description' => 'Enable the ephemeral Stories feature.',
+                'key' => 'instance.stories.enabled',
+            ],
+
+            [
+                'name' => 'Require Email Verification',
+                'description' => 'Require new accounts to verify their email address.',
+                'key' => 'pixelfed.enforce_email_verification',
+            ],
+
+            [
+                'name' => 'AutoSpam Detection',
+                'description' => 'Detect and remove spam from public timelines.',
+                'key' => 'pixelfed.bouncer.enabled',
+            ],
+        ])
+            ->map(function ($s) {
+                $s['state'] = (bool) config_cache($s['key']);
+
+                return $s;
+            });
+    }
+
+    public function getUsers(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $this->validate($request, [
+            'sort' => 'sometimes|in:asc,desc',
+        ]);
+        $q = $request->input('q');
+        $sort = $request->input('sort', 'desc') === 'asc' ? 'asc' : 'desc';
+        $res = User::whereNull('status')
+            ->when($q, function ($query, $q) {
+                return $query->where('username', 'like', '%'.$q.'%');
+            })
+            ->orderBy('id', $sort)
+            ->cursorPaginate(10);
+
+        return AdminUser::collection($res);
+    }
+
+    public function getUser(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $id = $request->input('user_id');
+        $key = 'pf-admin-api:getUser:byId:'.$id;
+        if ($request->has('refresh')) {
+            Cache::forget($key);
+        }
+
+        return Cache::remember($key, 86400, function () use ($id) {
+            $user = User::findOrFail($id);
+            $profile = $user->profile;
+            $account = AccountService::get($user->profile_id, true);
+            $res = (new AdminUser($user))->additional(['meta' => [
+                'cached_at' => str_replace('+00:00', 'Z', now()->format(DATE_RFC3339_EXTENDED)),
+                'account' => $account,
+                'dms_sent' => Conversation::whereFromId($profile->id)->count(),
+                'report_count' => Report::where('object_id', $profile->id)->orWhere('reported_profile_id', $profile->id)->count(),
+                'remote_report_count' => RemoteReport::whereAccountId($profile->id)->count(),
+                'moderation' => [
+                    'unlisted' => (bool) $profile->unlisted,
+                    'cw' => (bool) $profile->cw,
+                    'no_autolink' => (bool) $profile->no_autolink,
+                ],
+            ]]);
+
+            return $res;
+        });
+    }
+
+    public function userAdminAction(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'id' => 'required',
+            'action' => 'required|in:unlisted,cw,no_autolink,refresh_stats,verify_email,delete',
+            'value' => 'sometimes',
+        ]);
+
+        $id = $request->input('id');
+        $user = User::findOrFail($id);
+        $profile = Profile::findOrFail($user->profile_id);
+        $action = $request->input('action');
+
+        abort_if($user->is_admin == true && $action !== 'refresh_stats', 400, 'Cannot moderate admin accounts');
+        if ($action === 'delete') {
+            if (config('pixelfed.account_deletion') == false) {
+                abort(404);
+            }
+            abort_if($user->is_admin, 400, 'Cannot delete an admin account.');
+            $ts = now()->addMonth();
+            $user->status = 'delete';
+            $user->delete_after = $ts;
+            $user->save();
+            $profile->status = 'delete';
+            $profile->delete_after = $ts;
+            $profile->save();
+            ModLogService::boot()
+                ->objectUid($profile->id)
+                ->objectId($profile->id)
+                ->objectType('App\Profile::class')
+                ->user($request->user())
+                ->action('admin.user.delete')
+                ->accessLevel('admin')
+                ->save();
+            PublicTimelineService::deleteByProfileId($profile->id);
+            NetworkTimelineService::deleteByProfileId($profile->id);
+            if ($profile->user_id) {
+                DB::table('oauth_access_tokens')->whereUserId($user->id)->delete();
+                DB::table('oauth_auth_codes')->whereUserId($user->id)->delete();
+                $user->email = $user->id;
+                $user->password = '';
+                $user->status = 'delete';
+                $user->save();
+                $profile->status = 'delete';
+                $profile->delete_after = now()->addMonth();
+                $profile->save();
+                AccountService::del($profile->id);
+                DeleteAccountPipeline::dispatch($user)->onQueue('high');
+            } else {
+                $profile->status = 'delete';
+                $profile->delete_after = now()->addMonth();
+                $profile->save();
+                AccountService::del($profile->id);
+                DeleteRemoteProfilePipeline::dispatch($profile)->onQueue('high');
+            }
+
+            return [
+                'status' => 200,
+                'msg' => 'deleted',
+            ];
+        }
+
+        if ($action === 'refresh_stats') {
+            $profile->following_count = DB::table('followers')->whereProfileId($user->profile_id)->count();
+            $profile->followers_count = DB::table('followers')->whereFollowingId($user->profile_id)->count();
+            $profile->status_count = AccountStatService::recalculateStatusCount($user->profile_id);
+            $profile->save();
+        } elseif ($action === 'verify_email') {
+            $user->email_verified_at = now();
+            $user->save();
+
+            ModLogService::boot()
+                ->objectUid($user->id)
+                ->objectId($user->id)
+                ->objectType('App\User::class')
+                ->user($request->user())
+                ->action('admin.user.moderate')
+                ->metadata([
+                    'action' => 'Manually verified email address',
+                    'message' => 'Success!',
+                ])
+                ->accessLevel('admin')
+                ->save();
+        } elseif ($action === 'unlisted') {
+            ModLogService::boot()
+                ->objectUid($profile->id)
+                ->objectId($profile->id)
+                ->objectType('App\Profile::class')
+                ->user($request->user())
+                ->action('admin.user.moderate')
+                ->metadata([
+                    'action' => $action,
+                    'message' => 'Success!',
+                ])
+                ->accessLevel('admin')
+                ->save();
+            $profile->unlisted = ! $profile->unlisted;
+            $profile->save();
+        } elseif ($action === 'cw') {
+            ModLogService::boot()
+                ->objectUid($profile->id)
+                ->objectId($profile->id)
+                ->objectType('App\Profile::class')
+                ->user($request->user())
+                ->action('admin.user.moderate')
+                ->metadata([
+                    'action' => $action,
+                    'message' => 'Success!',
+                ])
+                ->accessLevel('admin')
+                ->save();
+            $profile->cw = ! $profile->cw;
+            $profile->save();
+        } elseif ($action === 'no_autolink') {
+            ModLogService::boot()
+                ->objectUid($profile->id)
+                ->objectId($profile->id)
+                ->objectType('App\Profile::class')
+                ->user($request->user())
+                ->action('admin.user.moderate')
+                ->metadata([
+                    'action' => $action,
+                    'message' => 'Success!',
+                ])
+                ->accessLevel('admin')
+                ->save();
+            $profile->no_autolink = ! $profile->no_autolink;
+            $profile->save();
+        } else {
+            $profile->{$action} = filter_var($request->input('value'), FILTER_VALIDATE_BOOLEAN);
+            $profile->save();
+
+            ModLogService::boot()
+                ->objectUid($user->id)
+                ->objectId($user->id)
+                ->objectType('App\User::class')
+                ->user($request->user())
+                ->action('admin.user.moderate')
+                ->metadata([
+                    'action' => $action,
+                    'message' => 'Success!',
+                ])
+                ->accessLevel('admin')
+                ->save();
+        }
+
+        AccountService::del($user->profile_id);
+        $account = AccountService::get($user->profile_id, true);
+
+        return (new AdminUser($user))->additional(['meta' => [
+            'account' => $account,
+            'moderation' => [
+                'unlisted' => (bool) $profile->unlisted,
+                'cw' => (bool) $profile->cw,
+                'no_autolink' => (bool) $profile->no_autolink,
+            ],
+        ]]);
+    }
+
+    public function instances(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'q' => 'sometimes',
+            'sort' => 'sometimes|in:asc,desc',
+            'sort_by' => 'sometimes|in:id,status_count,user_count,domain',
+            'filter' => 'sometimes|in:all,unlisted,auto_cw,banned',
+        ]);
+
+        $q = $request->input('q');
+        $sort = $request->input('sort', 'desc') === 'asc' ? 'asc' : 'desc';
+        $sortBy = $request->input('sort_by', 'id');
+        $filter = $request->input('filter');
+
+        $res = Instance::when($q, function ($query, $q) {
+            return $query->where('domain', 'like', '%'.$q.'%');
+        })
+            ->when($filter, function ($query, $filter) {
+                if ($filter === 'all') {
+                    return $query;
+                }
+
+                return $query->where($filter, true);
+            })
+            ->when($sortBy, function ($query, $sortBy) use ($sort) {
+                return $query->orderBy($sortBy, $sort);
+            }, function ($query) {
+                return $query->orderBy('id', 'desc');
+            })
+            ->cursorPaginate(10)
+            ->withQueryString();
+
+        return AdminInstance::collection($res);
+    }
+
+    public function getInstance(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $id = $request->input('id');
+        $res = Instance::findOrFail($id);
+
+        return new AdminInstance($res);
+    }
+
+    public function moderateInstance(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'id' => 'required',
+            'key' => 'required|in:unlisted,auto_cw,banned',
+            'value' => 'required',
+        ]);
+
+        $id = $request->input('id');
+        $key = $request->input('key');
+        $value = (bool) filter_var($request->input('value'), FILTER_VALIDATE_BOOLEAN);
+        $res = Instance::findOrFail($id);
+        $res->{$key} = $value;
+        $res->save();
+
+        InstanceService::refresh();
+        NetworkTimelineService::warmCache(true);
+
+        return new AdminInstance($res);
+    }
+
+    public function refreshInstanceStats(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'id' => 'required',
+        ]);
+
+        $id = $request->input('id');
+        $instance = Instance::findOrFail($id);
+        $instance->user_count = Profile::whereDomain($instance->domain)->count();
+        $instance->status_count = Profile::whereDomain($instance->domain)->leftJoin('statuses', 'profiles.id', '=', 'statuses.profile_id')->count('statuses.id');
+        $instance->save();
+
+        return new AdminInstance($instance);
+    }
+
+    public function getAllStats(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        if ($request->has('refresh')) {
+            Cache::forget('admin-api:instance-all-stats-v1');
+        }
+
+        return Cache::remember('admin-api:instance-all-stats-v1', 1209600, function () {
+            $days = range(1, 7);
+            $res = [
+                'cached_at' => now()->format('c'),
+            ];
+            $minStatusId = SnowflakeService::byDate(now()->subDays(7));
+
+            foreach ($days as $day) {
+                $label = now()->subDays($day)->format('D');
+                $labelShort = substr($label, 0, 1);
+                $res['users']['days'][] = [
+                    'date' => now()->subDays($day)->format('M j Y'),
+                    'label_full' => $label,
+                    'label' => $labelShort,
+                    'count' => User::whereDate('created_at', now()->subDays($day))->count(),
+                ];
+
+                $res['posts']['days'][] = [
+                    'date' => now()->subDays($day)->format('M j Y'),
+                    'label_full' => $label,
+                    'label' => $labelShort,
+                    'count' => Status::whereNull('uri')->where('id', '>', $minStatusId)->whereDate('created_at', now()->subDays($day))->count(),
+                ];
+
+                $res['instances']['days'][] = [
+                    'date' => now()->subDays($day)->format('M j Y'),
+                    'label_full' => $label,
+                    'label' => $labelShort,
+                    'count' => Instance::whereDate('created_at', now()->subDays($day))->count(),
+                ];
+            }
+
+            $res['users']['total'] = DB::table('users')->count();
+            $res['users']['min'] = collect($res['users']['days'])->min('count');
+            $res['users']['max'] = collect($res['users']['days'])->max('count');
+            $res['users']['change'] = collect($res['users']['days'])->sum('count');
+            $res['posts']['total'] = DB::table('statuses')->whereNull('uri')->count();
+            $res['posts']['min'] = collect($res['posts']['days'])->min('count');
+            $res['posts']['max'] = collect($res['posts']['days'])->max('count');
+            $res['posts']['change'] = collect($res['posts']['days'])->sum('count');
+            $res['instances']['total'] = DB::table('instances')->count();
+            $res['instances']['min'] = collect($res['instances']['days'])->min('count');
+            $res['instances']['max'] = collect($res['instances']['days'])->max('count');
+            $res['instances']['change'] = collect($res['instances']['days'])->sum('count');
+
+            return $res;
+        });
+    }
+
+    public function getPosts(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $this->validate($request, [
+            'q' => 'sometimes|nullable|string|max:120',
+            'filter' => 'sometimes|in:all,local,remote,nsfw,unlisted,private',
+            'profile_id' => 'sometimes|nullable|integer',
+            'sort' => 'sometimes|in:asc,desc',
+        ]);
+
+        $q = trim((string) $request->input('q'));
+        $filter = $request->input('filter', 'local');
+        $profileId = $request->input('profile_id');
+        $sort = $request->input('sort', 'desc') === 'asc' ? 'asc' : 'desc';
+
+        $query = Status::query()
+            ->whereNull('reblog_of_id')
+            ->when($profileId, fn ($query) => $query->whereProfileId($profileId))
+            ->when($filter === 'local', fn ($query) => $query->whereNull('uri'))
+            ->when($filter === 'remote', fn ($query) => $query->whereNotNull('uri'))
+            ->when($filter === 'nsfw', fn ($query) => $query->whereIsNsfw(true))
+            ->when($filter === 'unlisted', fn ($query) => $query->whereScope('unlisted'))
+            ->when($filter === 'private', fn ($query) => $query->whereScope('private'));
+
+        if ($q !== '') {
+            if (ctype_digit($q)) {
+                $query->whereId($q);
+            } elseif (str_starts_with($q, '@')) {
+                $profile = Profile::whereUsername(ltrim($q, '@'))->first();
+
+                if (! $profile) {
+                    return response()->json([
+                        'data' => [],
+                        'meta' => [
+                            'path' => $request->url(),
+                            'per_page' => 30,
+                            'next_cursor' => null,
+                            'prev_cursor' => null,
+                        ],
+                    ]);
+                }
+
+                $query->whereProfileId($profile->id);
+            } else {
+                $query->where('caption', 'like', '%'.$q.'%');
+            }
+        }
+
+        $paginator = $query->orderBy('id', $sort)->cursorPaginate(30)->withQueryString();
+
+        $data = $paginator->getCollection()
+            ->map(fn ($status) => StatusService::get($status->id, false))
+            ->filter()
+            ->values();
+
+        return response()->json([
+            'data' => $data,
+            'meta' => [
+                'path' => $paginator->path(),
+                'per_page' => $paginator->perPage(),
+                'next_cursor' => $paginator->nextCursor()?->encode(),
+                'prev_cursor' => $paginator->previousCursor()?->encode(),
+            ],
+        ]);
+    }
+
+    public function getPost(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $this->validate($request, [
+            'id' => 'required|integer',
+        ]);
+
+        $status = Status::findOrFail($request->input('id'));
+        $res = StatusService::get($status->id, false);
+        abort_if(! $res, 404);
+
+        $profile = $status->profile;
+
+        return response()->json([
+            'data' => $res,
+            'meta' => [
+                'is_local' => $status->uri === null,
+                'type' => $status->type,
+                'scope' => $status->scope,
+                'is_nsfw' => (bool) $status->is_nsfw,
+                'report_count' => Report::whereIn('object_type', ['App\Status', Status::class])
+                    ->whereObjectId($status->id)
+                    ->count(),
+                'open_report_count' => Report::whereIn('object_type', ['App\Status', Status::class])
+                    ->whereObjectId($status->id)
+                    ->whereNull('admin_seen')
+                    ->count(),
+                'autospam' => AccountInterstitial::whereIn('item_type', ['App\Status', Status::class])
+                    ->whereItemId($status->id)
+                    ->whereType('post.autospam')
+                    ->whereNull('appeal_handled_at')
+                    ->exists(),
+                'profile' => [
+                    'id' => (string) $profile->id,
+                    'username' => $profile->username,
+                    'is_local' => $profile->domain === null,
+                    'user_id' => $profile->user_id ? (string) $profile->user_id : null,
+                    'is_admin' => (bool) ($profile->user?->is_admin ?? false),
+                    'moderation' => [
+                        'unlisted' => (bool) $profile->unlisted,
+                        'cw' => (bool) $profile->cw,
+                        'no_autolink' => (bool) $profile->no_autolink,
+                    ],
+                ],
+            ],
+        ]);
+    }
+
+    public function getProfiles(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $this->validate($request, [
+            'q' => 'sometimes|nullable|string|max:120',
+            'filter' => 'sometimes|in:all,local,remote',
+            'sort_by' => 'sometimes|in:id,followers_count,status_count',
+            'sort' => 'sometimes|in:asc,desc',
+        ]);
+
+        $q = ltrim(trim((string) $request->input('q')), '@');
+        $filter = $request->input('filter', 'all');
+        $sortBy = $request->input('sort_by', 'id');
+        $sort = $request->input('sort', 'desc') === 'asc' ? 'asc' : 'desc';
+
+        $query = Profile::query()
+            ->whereNull('status')
+            ->when($filter === 'local', fn ($query) => $query->whereNull('domain'))
+            ->when($filter === 'remote', fn ($query) => $query->whereNotNull('domain'))
+            ->when($q !== '', fn ($query) => $query->where('username', 'like', $q.'%'))
+            ->orderBy($sortBy, $sort);
+
+        if ($sortBy !== 'id') {
+            $query->orderBy('id', $sort);
+        }
+
+        return AdminProfile::collection($query->cursorPaginate(20)->withQueryString());
+    }
+
+    public function getProfile(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:read'), 404);
+
+        $this->validate($request, [
+            'id' => 'required|integer',
+        ]);
+
+        $profile = Profile::findOrFail($request->input('id'));
+
+        return (new AdminProfile($profile))->additional([
+            'meta' => [
+                'report_count' => Report::whereReportedProfileId($profile->id)->count(),
+                'open_report_count' => Report::whereReportedProfileId($profile->id)
+                    ->whereNull('admin_seen')
+                    ->count(),
+                'autospam_count' => $profile->user_id
+                    ? AccountInterstitial::whereUserId($profile->user_id)
+                        ->whereType('post.autospam')
+                        ->whereNull('appeal_handled_at')
+                        ->count()
+                    : 0,
+                'is_admin' => (bool) ($profile->user?->is_admin ?? false),
+            ],
+        ]);
+    }
+
+    public function moderateProfile(Request $request)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 404);
+        abort_unless($request->user()->is_admin == 1, 404);
+        abort_unless($request->user()->tokenCan('admin:write'), 404);
+
+        $this->validate($request, [
+            'id' => 'required|integer',
+            'key' => 'required|in:unlisted,cw,no_autolink',
+            'value' => 'required',
+        ]);
+
+        $profile = Profile::findOrFail($request->input('id'));
+
+        if ($profile->user_id && $profile->user && $profile->user->is_admin) {
+            return response()->json(['error' => 'Cannot moderate admin accounts'], 400);
+        }
+
+        $key = $request->input('key');
+        $value = (bool) filter_var($request->input('value'), FILTER_VALIDATE_BOOLEAN);
+
+        $profile->{$key} = $value;
+        $profile->save();
+
+        if ($key === 'unlisted' && $value) {
+            Status::whereProfileId($profile->id)
+                ->whereScope('public')
+                ->orderByDesc('id')
+                ->limit(500)
+                ->pluck('id')
+                ->each(function ($id) {
+                    PublicTimelineService::del($id);
+                    NetworkTimelineService::del($id);
+                });
+        }
+
+        AccountService::del($profile->id);
+        Cache::forget('pf:bouncer_v0:exemption_by_pid:'.$profile->id);
+        Cache::forget('pf:bouncer_v0:recent_by_pid:'.$profile->id);
+
+        if ($profile->user_id) {
+            Cache::forget('pf-admin-api:getUser:byId:'.$profile->user_id);
+        }
+
+        return new AdminProfile($profile->fresh());
+    }
+}
